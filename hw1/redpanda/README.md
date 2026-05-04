@@ -76,10 +76,10 @@ for i in $(seq 1 10); do echo "message $i"; done \
 
 ## 5. Отримання повідомлень через console consumer
 ```bash
-docker exec -it broker kafka-console-consumer \
-  --bootstrap-server broker:29092 \
-  --topic test-topic \
-  --from-beginning
+docker exec -it redpanda-0 rpk topic consume test-topic \
+  --offset start \
+  -X brokers=redpanda-0:9092 \
+  -X user=superuser -X pass=secretpassword
 ```
 
 <details open>
