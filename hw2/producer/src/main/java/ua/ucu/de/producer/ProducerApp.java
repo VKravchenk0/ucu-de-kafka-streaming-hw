@@ -1,52 +1,45 @@
 package ua.ucu.de.producer;
 
 import org.bytedeco.javacv.FFmpegFrameGrabber;
-import org.bytedeco.javacv.Frame;
 import org.bytedeco.javacv.Java2DFrameConverter;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 
 public class ProducerApp {
 
     public static void main(String[] args) throws Exception {
         Config cfg = Config.fromEnvAndArgs(args);
-        System.out.printf("Config: bootstrapServers=%s topic=%s partitions=%d producers=%d inputFile=%s%n",
+        System.out.printf("Config: bootstrapServers=%s topic=%s partitions=%d producers=%d inputFile=%s outputDir=%s%n",
                 cfg.getBootstrapServers(), cfg.getTopicName(), cfg.getNumPartitions(),
-                cfg.getNumProducers(), cfg.getInputFile());
+                cfg.getNumProducers(), cfg.getInputFile(), cfg.getOutputDir());
 
         TopicAdmin.ensureTopic(cfg.getBootstrapServers(), cfg.getTopicName(), cfg.getNumPartitions());
 
-        List<ua.ucu.de.producer.Frame> allFrames = extractFrames(cfg.getInputFile());
-        System.out.printf("Extracted %d frames from %s%n", allFrames.size(), cfg.getInputFile());
+        Path outDir = Path.of(cfg.getOutputDir());
+        Files.createDirectories(outDir);
 
-        // Partition frames across producers
-        List<List<ua.ucu.de.producer.Frame>> slices = new ArrayList<>();
-        for (int i = 0; i < cfg.getNumProducers(); i++) slices.add(new ArrayList<>());
-        for (int i = 0; i < allFrames.size(); i++) {
-            slices.get(i % cfg.getNumProducers()).add(allFrames.get(i));
-        }
+        // Queue capacity = 2x number of producers; limits in-flight frames in memory
+        BlockingQueue<Frame> queue = new ArrayBlockingQueue<>(cfg.getNumProducers() * 2);
 
-        List<Thread> threads = new ArrayList<>();
+        // Start sender threads
+        List<Thread> senderThreads = new ArrayList<>();
         for (int i = 0; i < cfg.getNumProducers(); i++) {
-            int id = i;
             Thread t = Thread.ofPlatform().name("producer-" + i)
-                    .start(new FrameProducer(id, cfg.getBootstrapServers(), cfg.getTopicName(), slices.get(id)));
-            threads.add(t);
+                    .start(new FrameProducer(i, cfg.getBootstrapServers(), cfg.getTopicName(), queue));
+            senderThreads.add(t);
         }
 
-        for (Thread t : threads) t.join();
-        System.out.println("All producers finished.");
-    }
-
-    private static List<ua.ucu.de.producer.Frame> extractFrames(String filePath) throws Exception {
-        List<ua.ucu.de.producer.Frame> frames = new ArrayList<>();
-
-        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(filePath);
+        // Grab frames one at a time, convert, enqueue for sending
+        try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(cfg.getInputFile());
              Java2DFrameConverter converter = new Java2DFrameConverter()) {
 
             grabber.start();
@@ -54,17 +47,29 @@ public class ProducerApp {
                     grabber.getImageWidth(), grabber.getImageHeight(),
                     grabber.getFrameRate(), grabber.getLengthInFrames());
 
-            Frame frame;
+            org.bytedeco.javacv.Frame avFrame;
             int frameNum = 0;
-            while ((frame = grabber.grabImage()) != null) {
-                BufferedImage image = converter.convert(frame);
+            while ((avFrame = grabber.grabImage()) != null) {
+                BufferedImage image = converter.convert(avFrame);
                 if (image == null) continue;
 
                 byte[] jpegBytes = toJpeg(image);
-                frames.add(new ua.ucu.de.producer.Frame(frameNum++, jpegBytes));
+
+                // Block if senders are busy — avoids loading the whole video into memory
+                queue.put(new Frame(frameNum, jpegBytes));
+                System.out.printf("[Grabber] Queued frame %d (%d bytes)%n", frameNum, jpegBytes.length);
+                frameNum++;
             }
+            System.out.printf("[Grabber] Done. Grabbed %d frames.%n", frameNum);
         }
-        return frames;
+
+        // Signal end-of-stream: one poison pill is enough; senders re-enqueue it for siblings
+        queue.put(FrameProducer.POISON);
+
+        for (Thread t : senderThreads) {
+            t.join();
+        } 
+        System.out.println("All producers finished.");
     }
 
     private static byte[] toJpeg(BufferedImage image) throws IOException {

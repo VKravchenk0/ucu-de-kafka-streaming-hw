@@ -11,6 +11,7 @@ public class Config {
     private final int numPartitions;
     private final int numProducers;
     private final String inputFile;
+    private final String outputDir;
 
     public static Config fromEnvAndArgs(String[] args) {
         ConfigBuilder b = Config.builder()
@@ -18,7 +19,8 @@ public class Config {
             .topicName(env("TOPIC_NAME", "frames"))
             .numPartitions(Integer.parseInt(env("NUM_PARTITIONS", "1")))
             .numProducers(Integer.parseInt(env("NUM_PRODUCERS", "1")))
-            .inputFile(env("INPUT_FILE", "input.mp4"));
+            .inputFile(env("INPUT_FILE", "input.mp4"))
+            .outputDir(env("OUTPUT_DIR", "./output"));
 
         for (int i = 0; i < args.length - 1; i++) {
             switch (args[i]) {
@@ -27,6 +29,7 @@ public class Config {
                 case "--num-partitions"    -> b.numPartitions(Integer.parseInt(args[++i]));
                 case "--num-producers"     -> b.numProducers(Integer.parseInt(args[++i]));
                 case "--input-file"        -> b.inputFile(args[++i]);
+                case "--output-dir"        -> b.outputDir(args[++i]);
             }
         }
         return b.build();

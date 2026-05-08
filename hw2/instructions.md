@@ -19,3 +19,5 @@ Configuration 2: Everything runs in docker (kafka and producers/consumers)
 - Make sure to test running the app yourself. Both in "docker + standalone" version as well as fully docker version. If docker fails for some reason - you can delete the containers and related docker volumes to start from scratch
 - Don't do the experiments yourself (you can do just to test that parameters are passed correctly; but I'll do the complete experiment myself)
 - Multiple producers and consumers must start in different java threads (but as a part of a single instance of a microservice)
+- Make sure the video is split frame-by-frame, not by some arbitrary chunks. I want to check the frames myself, so when you retrieve image bytes - save them to a file with name template "output/frame-{frameNum}.jpeg"
+- Current implementation first loads all frames into memory, and only then sends them. It can cause OOM for large videos. Rework the solution so that each frame is sent to broker as the we iterate frame by frame

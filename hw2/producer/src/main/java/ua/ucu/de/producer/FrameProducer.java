@@ -8,20 +8,26 @@ import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
 import java.nio.ByteBuffer;
-import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class FrameProducer implements Runnable {
+    // Sentinel value signalling end-of-stream to sender threads
+    static final Frame POISON = new Frame(-1, null);
+
     private final int producerId;
     private final String bootstrapServers;
     private final String topicName;
-    private final List<Frame> frames;
+    private final BlockingQueue<Frame> queue;
+    private final AtomicInteger sentCount = new AtomicInteger();
 
-    public FrameProducer(int producerId, String bootstrapServers, String topicName, List<Frame> frames) {
+    public FrameProducer(int producerId, String bootstrapServers, String topicName,
+                         BlockingQueue<Frame> queue) {
         this.producerId = producerId;
         this.bootstrapServers = bootstrapServers;
         this.topicName = topicName;
-        this.frames = frames;
+        this.queue = queue;
     }
 
     @Override
@@ -33,7 +39,21 @@ public class FrameProducer implements Runnable {
         props.put(ProducerConfig.ACKS_CONFIG, "1");
 
         try (KafkaProducer<String, byte[]> producer = new KafkaProducer<>(props)) {
-            for (Frame frame : frames) {
+            while (true) {
+                Frame frame;
+                try {
+                    frame = queue.take();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+
+                if (frame == POISON) {
+                    // Put the poison back for other sender threads, then stop
+                    queue.offer(POISON);
+                    break;
+                }
+
                 long sendTime = System.currentTimeMillis();
                 byte[] sendTimeBytes = ByteBuffer.allocate(8).putLong(sendTime).array();
 
@@ -45,11 +65,12 @@ public class FrameProducer implements Runnable {
                 record.headers().add(new RecordHeader("send_time_ms", sendTimeBytes));
 
                 producer.send(record);
+                int n = sentCount.incrementAndGet();
                 System.out.printf("[Producer %d] Sent frame %d (%d bytes)%n",
                         producerId, frame.frameNumber(), frame.data().length);
             }
             producer.flush();
         }
-        System.out.printf("[Producer %d] Done. Sent %d frames.%n", producerId, frames.size());
+        System.out.printf("[Producer %d] Done. Sent %d frames.%n", producerId, sentCount.get());
     }
 }

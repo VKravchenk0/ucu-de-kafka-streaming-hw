@@ -9,7 +9,8 @@
       "Bash(docker exec *)",
       "Bash(wait)",
       "Bash(curl -s \"https://search.maven.org/solrsearch/select?q=g:org.bytedeco+a:javacv&rows=1&wt=json\")",
-      "Bash(java -jar /home/vs/p/ucu/de/09-data-streaming-with-kafka/ucu-de-kafka-streaming-hw/hw2/producer/target/producer-1.0-SNAPSHOT.jar --bootstrap-servers localhost:9092 --input-file /home/vs/p/ucu/de/09-data-streaming-with-kafka/ucu-de-kafka-streaming-hw/hw2/input.mp4 --num-partitions 0)"
+      "Bash(java -jar /home/vs/p/ucu/de/09-data-streaming-with-kafka/ucu-de-kafka-streaming-hw/hw2/producer/target/producer-1.0-SNAPSHOT.jar --bootstrap-servers localhost:9092 --input-file /home/vs/p/ucu/de/09-data-streaming-with-kafka/ucu-de-kafka-streaming-hw/hw2/input.mp4 --num-partitions 0)",
+      "Bash(java -jar /home/vs/p/ucu/de/09-data-streaming-with-kafka/ucu-de-kafka-streaming-hw/hw2/producer/target/producer-1.0-SNAPSHOT.jar --bootstrap-servers localhost:9092 --topic frames --num-partitions 1 --num-producers 1 --input-file /home/vs/p/ucu/de/09-data-streaming-with-kafka/ucu-de-kafka-streaming-hw/hw2/input.mp4 --output-dir /home/vs/p/ucu/de/09-data-streaming-with-kafka/ucu-de-kafka-streaming-hw/hw2/output)"
     ],
     "additionalDirectories": [
       "/home/vs/p/ucu/de/09-data-streaming-with-kafka/ucu-de-kafka-streaming-hw/hw2/output"

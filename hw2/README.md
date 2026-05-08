@@ -19,11 +19,13 @@ Config 2 (fully Docker):
 ```bash
 docker compose --profile infra up -d
 # docker compose --profile infra up -d broker broker-2 broker-3
-docker compose up consumer
-docker compose run --rm producer
+docker compose up --build consumer
+docker compose run --build --rm producer
 # wait for consumer to finish, then:
 docker compose stop consumer
-docker compose run --rm stat-aggregator
+docker compose run --build --rm stat-aggregator
+
+#docker compose build --no-cache producer consumer stat-aggregator
 ```
 
 
