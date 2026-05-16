@@ -13,6 +13,19 @@ docker exec broker kafka-topics \
     --bootstrap-server localhost:9092 \
     --delete --topic "$TOPIC_NAME" 2>/dev/null || true
 
+# Wait until fully deleted (deletion is async)
+until ! docker exec broker kafka-topics \
+    --bootstrap-server localhost:9092 \
+    --list 2>/dev/null | grep -qx "$TOPIC_NAME"; do sleep 1; done
+
+# Create with correct partition count
+docker exec broker kafka-topics \
+    --bootstrap-server localhost:9092 \
+    --create --topic "$TOPIC_NAME" \
+    --partitions "$NUM_PARTITIONS" \
+    --replication-factor 1
+echo "--- Topic '$TOPIC_NAME' created with $NUM_PARTITIONS partition(s) ---"
+
 # Clear previous run results
 rm -f output/*.csv output/report.txt
 

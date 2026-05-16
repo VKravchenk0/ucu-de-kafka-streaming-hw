@@ -58,9 +58,11 @@ public class FrameConsumer implements Runnable {
             topics.add(cfg.getTopicName());
             consumer.subscribe(topics);
 
-            long idleTimeoutMs = cfg.getExitOnIdleSeconds() * 1000L;
-            long lastMessageTime = System.currentTimeMillis();
-            boolean hadMessages = false;
+            long idleTimeoutMs    = cfg.getExitOnIdleSeconds() * 1000L;
+            long startupTimeoutMs = cfg.getStartupTimeoutSeconds() * 1000L;
+            long startTime        = System.currentTimeMillis();
+            long lastMessageTime  = startTime;
+            boolean hadMessages   = false;
 
             while (running.get()) {
                 ConsumerRecords<String, byte[]> records = consumer.poll(Duration.ofMillis(500));
@@ -85,10 +87,16 @@ public class FrameConsumer implements Runnable {
                     csv.flush();
                 }
 
-                if (hadMessages && System.currentTimeMillis() - lastMessageTime > idleTimeoutMs) {
+                long now = System.currentTimeMillis();
+                if (hadMessages && now - lastMessageTime > idleTimeoutMs) {
                     System.out.printf("[Consumer %d] No messages for %ds, exiting.%n",
                             consumerId, cfg.getExitOnIdleSeconds());
-                    running.set(false);
+                    break;
+                }
+                if (!hadMessages && now - startTime > startupTimeoutMs) {
+                    System.out.printf("[Consumer %d] No messages received in %ds, exiting.%n",
+                            consumerId, cfg.getStartupTimeoutSeconds());
+                    break;
                 }
             }
         } catch (IOException | InterruptedException e) {
