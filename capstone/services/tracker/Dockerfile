@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY tracker/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY common ./common
+COPY tracker/main.py .
+CMD ["python", "main.py"]
