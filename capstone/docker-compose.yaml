@@ -332,7 +332,8 @@ services:
 
   # ─────────────────────────────────────────────────────────────
   # App services  (profile: app)
-  # Start after infra:  docker compose --profile app up
+  # Step 1 (one-off):  docker compose --profile app up topic-init
+  # Step 2 (all):      docker compose --profile app up -d --no-recreate
   # ─────────────────────────────────────────────────────────────
 
   topic-init:
@@ -352,16 +353,15 @@ services:
       dockerfile: generator/Dockerfile
     container_name: generator
     volumes:
-      - ./input.mp4:/data/input.mp4:ro
+      - uploads:/uploads
     environment:
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
-      VIDEO_PATH: /data/input.mp4
+      CONTROL_TOPIC: control.upload
       OUTPUT_TOPIC: frames.raw
       TARGET_WIDTH: "640"
       TARGET_HEIGHT: "480"
       JPEG_QUALITY: "85"
       FRAME_INTERVAL: "1"
-      LOOP: "true"
     depends_on:
       - topic-init
     restart: on-failure
@@ -458,12 +458,54 @@ services:
       context: ./services
       dockerfile: statistics/Dockerfile
     container_name: statistics
+    ports:
+      - "8002:8002"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
       CAR_TOPIC: tracking.cars
       PERSON_TOPIC: tracking.persons
       GROUP_ID: statistics-group
-      PRINT_INTERVAL_FRAMES: "30"
+      HTTP_PORT: "8002"
     depends_on:
       - topic-init
     restart: on-failure
+
+  renderer:
+    profiles: [app]
+    build:
+      context: ./services
+      dockerfile: renderer/Dockerfile
+    container_name: renderer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: broker:29092
+      OUTPUT_TOPIC: frames.rendered
+      GROUP_ID: renderer-group
+      MAX_BUFFER_ENTRIES: "300"
+    depends_on:
+      - topic-init
+    restart: on-failure
+
+  web:
+    profiles: [app]
+    build:
+      context: ./services
+      dockerfile: web/Dockerfile
+    container_name: web
+    ports:
+      - "8080:8080"
+    volumes:
+      - uploads:/uploads
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: broker:29092
+      UPLOAD_DIR: /uploads
+      KAFKA_UPLOAD_TOPIC: control.upload
+      RENDERED_TOPIC: frames.rendered
+      STATS_URL: http://statistics:8002/stats
+      HTTP_PORT: "8080"
+    depends_on:
+      - topic-init
+      - statistics
+    restart: on-failure
+
+volumes:
+  uploads:

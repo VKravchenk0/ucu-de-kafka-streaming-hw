@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Viewer — {{ session_id[:8] }}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0;
+           min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+           padding: 2rem; gap: 1.5rem; }
+    h1 { font-size: 1.3rem; font-weight: 700; }
+    .session-id { font-size: .75rem; color: #64748b; font-family: monospace; }
+    .layout { display: flex; gap: 1.5rem; align-items: flex-start; flex-wrap: wrap; justify-content: center; }
+    .video-wrap { position: relative; }
+    #stream { border-radius: 10px; border: 2px solid #2d3250; max-width: 720px; width: 100%; display: block; }
+    #waiting { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+               background: #1e2130; border-radius: 10px; color: #64748b; font-size: .9rem; }
+    .stats-panel { background: #1e2130; border: 1px solid #2d3250; border-radius: 12px;
+                   padding: 1.5rem; min-width: 220px; display: flex; flex-direction: column; gap: 1rem; }
+    .stats-panel h2 { font-size: .95rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .08em; }
+    .stat-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+    .stat-label { font-size: .85rem; color: #94a3b8; }
+    .stat-value { font-size: 1.6rem; font-weight: 700; }
+    .cars   { color: #f87171; }
+    .people { color: #34d399; }
+    .divider { border: none; border-top: 1px solid #2d3250; }
+    .session-stat { font-size: .8rem; color: #94a3b8; }
+    .global-section h2 { color: #64748b; }
+    a.back { font-size: .85rem; color: #4f6ef7; text-decoration: none; }
+    a.back:hover { text-decoration: underline; }
+    #status-badge { font-size: .75rem; padding: .2rem .6rem; border-radius: 99px;
+                    background: #1e3a2f; color: #34d399; font-weight: 600; }
+    #status-badge.done { background: #1e2d3a; color: #60a5fa; }
+  </style>
+</head>
+<body>
+  <div style="display:flex;align-items:center;gap:1rem;width:100%;max-width:1000px">
+    <a class="back" href="/">← Upload another</a>
+    <h1>Session <span class="session-id">{{ session_id }}</span></h1>
+    <span id="status-badge">processing</span>
+  </div>
+
+  <div class="layout">
+    <div class="video-wrap">
+      <img id="stream" src="/stream/{{ session_id }}" alt="video stream"
+           onload="document.getElementById('waiting').style.display='none'">
+      <div id="waiting">Waiting for first frame…</div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:1rem">
+      <!-- Per-session stats -->
+      <div class="stats-panel">
+        <h2>This session</h2>
+        <div class="stat-row">
+          <span class="stat-label">Unique Cars</span>
+          <span class="stat-value cars" id="s-cars">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Unique People</span>
+          <span class="stat-value people" id="s-people">—</span>
+        </div>
+        <hr class="divider">
+        <div class="session-stat">Frames processed: <span id="s-frames-c">—</span> / <span id="s-frames-p">—</span></div>
+      </div>
+
+      <!-- Global stats -->
+      <div class="stats-panel global-section">
+        <h2>All sessions</h2>
+        <div class="stat-row">
+          <span class="stat-label">Cars</span>
+          <span class="stat-value cars" id="g-cars">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">People</span>
+          <span class="stat-value people" id="g-people">—</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const SESSION_ID = "{{ session_id }}";
+
+    function updateStats() {
+      fetch('/stats')
+        .then(r => r.json())
+        .then(data => {
+          const g = data.global || {};
+          document.getElementById('g-cars').textContent   = g.unique_cars   ?? '—';
+          document.getElementById('g-people').textContent = g.unique_persons ?? '—';
+
+          const sess = (data.sessions || {})[SESSION_ID];
+          if (sess) {
+            document.getElementById('s-cars').textContent     = sess.unique_cars;
+            document.getElementById('s-people').textContent   = sess.unique_persons;
+            document.getElementById('s-frames-c').textContent = sess.frames_cars;
+            document.getElementById('s-frames-p').textContent = sess.frames_persons;
+
+            const badge = document.getElementById('status-badge');
+            badge.textContent = sess.status;
+            if (sess.status === 'done') badge.className = 'done';
+          }
+        })
+        .catch(() => {});
+    }
+
+    updateStats();
+    setInterval(updateStats, 3000);
+  </script>
+</body>
+</html>

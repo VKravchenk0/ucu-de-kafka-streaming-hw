@@ -14,18 +14,27 @@ logger = logging.getLogger(__name__)
 BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "broker:29092")
 
 TOPICS = [
+    # ── video frame pipeline ──────────────────────────────────────────────
     NewTopic("frames.raw",            num_partitions=3, replication_factor=1,
              config={"max.message.bytes": "5242880"}),
     NewTopic("frames.preprocessed",   num_partitions=3, replication_factor=1,
              config={"max.message.bytes": "5242880"}),
+    NewTopic("frames.rendered",       num_partitions=3, replication_factor=1,
+             config={"max.message.bytes": "5242880"}),
+    # ── detection / tracking ──────────────────────────────────────────────
     NewTopic("detections.cars",       num_partitions=3, replication_factor=1,
              config={"max.message.bytes": "262144"}),
     NewTopic("detections.persons",    num_partitions=3, replication_factor=1,
              config={"max.message.bytes": "262144"}),
-    NewTopic("tracking.cars",         num_partitions=1, replication_factor=1,
+    NewTopic("tracking.cars",         num_partitions=3, replication_factor=1,
              config={"max.message.bytes": "262144"}),
-    NewTopic("tracking.persons",      num_partitions=1, replication_factor=1,
+    NewTopic("tracking.persons",      num_partitions=3, replication_factor=1,
              config={"max.message.bytes": "262144"}),
+    # ── control ───────────────────────────────────────────────────────────
+    NewTopic("control.upload",        num_partitions=1, replication_factor=1,
+             config={"max.message.bytes": "4096"}),
+    NewTopic("control.session_end",   num_partitions=1, replication_factor=1,
+             config={"max.message.bytes": "4096"}),
 ]
 
 MAX_RETRIES = 30
@@ -62,7 +71,6 @@ def main() -> None:
             future.result()
             logger.info("Created topic: %s", topic)
         except KafkaException as exc:
-            # TOPIC_ALREADY_EXISTS is not an error in our context
             if "TOPIC_ALREADY_EXISTS" in str(exc) or "already exists" in str(exc).lower():
                 logger.info("Topic already exists: %s", topic)
             else:

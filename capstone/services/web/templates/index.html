@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Video Detection Pipeline</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh;
+           display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2rem; }
+    h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: .03em; }
+    .card { background: #1e2130; border: 1px solid #2d3250; border-radius: 12px;
+            padding: 2rem; width: 420px; display: flex; flex-direction: column; gap: 1.2rem; }
+    label { font-size: .85rem; color: #94a3b8; }
+    input[type=file] { width: 100%; padding: .6rem; background: #0f1117; border: 1px solid #2d3250;
+                       border-radius: 8px; color: #e2e8f0; cursor: pointer; }
+    button { padding: .75rem 1.5rem; background: #4f6ef7; color: #fff; border: none;
+             border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    button:hover { background: #3b56e0; }
+    button:disabled { background: #374151; cursor: not-allowed; }
+    #status { font-size: .9rem; color: #94a3b8; min-height: 1.2em; }
+    #status.ok  { color: #34d399; }
+    #status.err { color: #f87171; }
+    .progress { height: 4px; background: #2d3250; border-radius: 2px; overflow: hidden; display: none; }
+    .progress-bar { height: 100%; background: #4f6ef7; width: 0; transition: width .3s; }
+  </style>
+</head>
+<body>
+  <h1>Video Detection Pipeline</h1>
+  <div class="card">
+    <label for="file">Select a video file (MP4 / AVI / MOV)</label>
+    <input type="file" id="file" accept="video/*">
+    <div class="progress" id="progress-wrap">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+    <button id="btn" onclick="doUpload()">Upload &amp; Process</button>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    async function doUpload() {
+      const fileInput = document.getElementById('file');
+      const btn = document.getElementById('btn');
+      const status = document.getElementById('status');
+      const wrap = document.getElementById('progress-wrap');
+      const bar = document.getElementById('progress-bar');
+
+      if (!fileInput.files.length) {
+        status.textContent = 'Please select a file first.';
+        status.className = 'err';
+        return;
+      }
+
+      const file = fileInput.files[0];
+      btn.disabled = true;
+      status.className = '';
+      status.textContent = 'Uploading…';
+      wrap.style.display = 'block';
+
+      const fd = new FormData();
+      fd.append('file', file);
+
+      try {
+        const xhr = new XMLHttpRequest();
+        xhr.upload.onprogress = e => {
+          if (e.lengthComputable) bar.style.width = (e.loaded / e.total * 100) + '%';
+        };
+
+        const result = await new Promise((resolve, reject) => {
+          xhr.onload = () => {
+            if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
+            else reject(new Error(`HTTP ${xhr.status}`));
+          };
+          xhr.onerror = () => reject(new Error('Network error'));
+          xhr.open('POST', '/upload');
+          xhr.send(fd);
+        });
+
+        bar.style.width = '100%';
+        status.textContent = 'Processing started — redirecting to viewer…';
+        status.className = 'ok';
+        setTimeout(() => window.location.href = '/view/' + result.session_id, 800);
+      } catch (e) {
+        status.textContent = 'Upload failed: ' + e.message;
+        status.className = 'err';
+        btn.disabled = false;
+        wrap.style.display = 'none';
+      }
+    }
+  </script>
+</body>
+</html>

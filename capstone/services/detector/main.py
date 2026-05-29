@@ -1,7 +1,7 @@
 """Detector: runs YOLOv8n on preprocessed frames and publishes detections.
 
 Env vars:
-  CLASS_IDS   comma-separated COCO class IDs to keep (e.g. "2,5,7" for cars)
+  CLASS_IDS    comma-separated COCO class IDs to keep (e.g. "2,5,7" for cars)
   INPUT_TOPIC  (default: frames.preprocessed)
   OUTPUT_TOPIC (default: detections.cars)
   GROUP_ID     consumer group id
@@ -79,16 +79,17 @@ def main() -> None:
                 continue
 
             envelope = json.loads(msg.value())
+            session_id = envelope["session_id"]
             img = decode_frame(envelope["data"])
             dets = detect(model, img)
 
             out = json.dumps({
+                "session_id": session_id,
                 "frame_number": envelope["frame_number"],
                 "timestamp": envelope["timestamp"],
                 "detections": dets,
             })
-
-            produce_with_backpressure(producer, OUTPUT_TOPIC, str(envelope["frame_number"]), out)
+            produce_with_backpressure(producer, OUTPUT_TOPIC, session_id, out)
             processed += 1
 
             if processed % 50 == 0:

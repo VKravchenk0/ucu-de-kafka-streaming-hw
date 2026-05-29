@@ -1,4 +1,7 @@
-"""Tracker: applies centroid tracking to detections and publishes track events.
+"""Tracker: applies centroid tracking per session and publishes track events.
+
+Each session_id gets its own CentroidTracker instance so multiple concurrent
+video uploads do not interfere with each other.
 
 Env vars:
   OBJECT_TYPE   "car" or "person"
@@ -27,12 +30,15 @@ OUTPUT_TOPIC = os.environ.get("OUTPUT_TOPIC", f"tracking.{OBJECT_TYPE}s")
 GROUP_ID = os.environ.get("GROUP_ID", f"tracker-{OBJECT_TYPE}")
 MAX_DISAPPEARED = int(os.environ.get("MAX_DISAPPEARED", "30"))
 MAX_DISTANCE = int(os.environ.get("MAX_DISTANCE", "100"))
+SESSION_END_TOPIC = "control.session_end"
 
 
 def main() -> None:
-    tracker = CentroidTracker(max_disappeared=MAX_DISAPPEARED, max_distance=MAX_DISTANCE)
+    # session_id → CentroidTracker
+    trackers: dict[str, CentroidTracker] = {}
+
     producer = make_producer()
-    consumer = make_consumer(GROUP_ID, [INPUT_TOPIC])
+    consumer = make_consumer(GROUP_ID, [INPUT_TOPIC, SESSION_END_TOPIC])
     processed = 0
 
     logger.info("Tracker ready — object_type=%s  %s → %s", OBJECT_TYPE, INPUT_TOPIC, OUTPUT_TOPIC)
@@ -47,28 +53,40 @@ def main() -> None:
                 continue
 
             envelope = json.loads(msg.value())
+            session_id = envelope["session_id"]
+
+            if msg.topic() == SESSION_END_TOPIC:
+                removed = trackers.pop(session_id, None)
+                if removed is not None:
+                    logger.info("[%s] Session ended — total_unique_%ss=%d",
+                                session_id[:8], OBJECT_TYPE, removed.total_seen)
+                continue
+
+            # Lazily create tracker for new session
+            if session_id not in trackers:
+                trackers[session_id] = CentroidTracker(
+                    max_disappeared=MAX_DISAPPEARED,
+                    max_distance=MAX_DISTANCE,
+                )
+
+            tracker = trackers[session_id]
             active_tracks = tracker.update(envelope.get("detections", []))
 
-            tracks_list = [
-                {"track_id": tid, "bbox": bbox}
-                for tid, bbox in active_tracks.items()
-            ]
-
             out = json.dumps({
+                "session_id": session_id,
                 "frame_number": envelope["frame_number"],
                 "timestamp": envelope.get("timestamp"),
                 "object_type": OBJECT_TYPE,
-                "tracks": tracks_list,
+                "tracks": [{"track_id": tid, "bbox": bbox} for tid, bbox in active_tracks.items()],
                 "total_unique": tracker.total_seen,
             })
-
-            produce_with_backpressure(producer, OUTPUT_TOPIC, str(envelope["frame_number"]), out)
+            produce_with_backpressure(producer, OUTPUT_TOPIC, session_id, out)
             processed += 1
 
             if processed % 50 == 0:
                 logger.info(
-                    "Tracked %d frames — active=%d  total_unique=%d",
-                    processed, len(active_tracks), tracker.total_seen,
+                    "Tracked %d frames — sessions=%d  active_tracks=%d",
+                    processed, len(trackers), len(active_tracks),
                 )
 
     except KeyboardInterrupt:
@@ -76,10 +94,7 @@ def main() -> None:
     finally:
         producer.flush()
         consumer.close()
-        logger.info(
-            "Tracker stopped — processed %d frames  total_unique_%ss=%d",
-            processed, OBJECT_TYPE, tracker.total_seen,
-        )
+        logger.info("Tracker stopped — processed %d frames  sessions=%d", processed, len(trackers))
 
 
 if __name__ == "__main__":
