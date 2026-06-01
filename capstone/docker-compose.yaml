@@ -364,7 +364,7 @@ services:
     container_name: generator
     environment:
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
-      FRAME_INTERVAL: "1"
+      FRAME_INTERVAL: "3"
       JPEG_QUALITY: "85"
     volumes:
       - uploads:/uploads

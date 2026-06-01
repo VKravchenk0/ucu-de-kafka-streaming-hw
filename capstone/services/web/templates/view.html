@@ -13,9 +13,10 @@
     header h1 { font-size: 1.1rem; color: #fff; }
     header .sid { font-size: 0.75rem; color: #555; font-family: monospace; }
     .badge { padding: 0.2rem 0.6rem; border-radius: 99px; font-size: 0.75rem; font-weight: 600; }
-    .badge-live { background: #1a3d1a; color: #4caf50; }
-    .badge-done { background: #2a2a1a; color: #ffc107; }
-    .badge-wait { background: #1a1a2a; color: #888; }
+    .badge-live   { background: #1a3d1a; color: #4caf50; }
+    .badge-done   { background: #2a2a1a; color: #ffc107; }
+    .badge-wait   { background: #1a1a2a; color: #888; }
+    .badge-buffer { background: #2a1a0a; color: #ffa726; }
     main { display: flex; flex: 1; gap: 0; }
     .video-wrap { position: relative; flex: 1; background: #000; display: flex;
                   align-items: center; justify-content: center; }
@@ -51,7 +52,7 @@
 
   <main>
     <div class="video-wrap" id="video-wrap">
-      <video id="vid" src="/video/{{ session_id }}" controls autoplay muted playsinline></video>
+      <video id="vid" src="/video/{{ session_id }}" controls muted playsinline></video>
       <canvas id="overlay"></canvas>
     </div>
 
@@ -65,7 +66,7 @@
       </div>
 
       <div class="info" id="info-box">
-        Video is loading. Detection boxes will appear within a few seconds after the pipeline processes the first frames.
+        Waiting for the detection pipeline… Video will start automatically once the first frames are ready.
       </div>
     </aside>
   </main>
@@ -97,15 +98,28 @@
 
     // -----------------------------------------------------------------------
     // Overlay buffer: Map from video_timestamp_ms -> overlay payload
-    // We keep the latest N entries and find the one closest to currentTime
-    // -----------------------------------------------------------------------
-    // Detection runs faster than video playback — buffer all frames for the whole video.
     // Exposed on window so you can inspect from DevTools console: window.overlayBuffer.size
+    // -----------------------------------------------------------------------
     const overlayBuffer = new Map();
     window.overlayBuffer = overlayBuffer;
 
+    // Highest video_timestamp_ms buffered so far (-1 = nothing yet).
+    // Used to hold video playback until the pipeline is ahead of the player.
+    let maxBufferedMs = -1;
+    // Set to true once the _done signal arrives; video plays freely after that.
+    let processingDone = false;
+    // ms the buffer must lead the playhead before we allow video to resume.
+    const BUFFER_LEAD_MS = 500;
+
     function addOverlay(payload) {
       overlayBuffer.set(payload.video_timestamp_ms, payload);
+      if (payload.video_timestamp_ms > maxBufferedMs) {
+        maxBufferedMs = payload.video_timestamp_ms;
+      }
+      // Resume playback if the buffer has caught up to the current playhead.
+      if (vid.paused && !processingDone && maxBufferedMs >= vid.currentTime * 1000) {
+        vid.play().catch(() => {});
+      }
     }
 
     function findClosestOverlay(currentMs, toleranceMs = 2000) {
@@ -168,9 +182,30 @@
         setEl('persons-total', overlay.persons_total    ?? '—');
       }
 
+      // Buffer-aware pause: hold the video if the pipeline hasn't caught up yet.
+      if (!processingDone) {
+        if (maxBufferedMs < 0) {
+          // Nothing buffered yet — keep paused, show waiting state.
+          if (!vid.paused) vid.pause();
+          statusBadge.textContent = 'Buffering…';
+          statusBadge.className = 'badge badge-buffer';
+        } else if (currentMs > maxBufferedMs + BUFFER_LEAD_MS) {
+          // Video outran the buffer — pause until more overlays arrive.
+          if (!vid.paused) {
+            vid.pause();
+            statusBadge.textContent = 'Buffering…';
+            statusBadge.className = 'badge badge-buffer';
+          }
+        } else if (vid.paused) {
+          // Buffer is ahead again — this branch is normally handled by addOverlay,
+          // but catches the case where the user manually paused then seeked.
+          vid.play().catch(() => {});
+        }
+      }
+
       // Log every ~3 seconds so you can verify data in the browser console
       if (++_dbgTick % 180 === 0) {
-        console.log(`[overlay] t=${currentMs.toFixed(0)}ms buffer=${overlayBuffer.size} overlay=${overlay ? JSON.stringify({cars:overlay.cars_in_frame, persons:overlay.persons_in_frame}) : 'null'}`);
+        console.log(`[overlay] t=${currentMs.toFixed(0)}ms maxBuf=${maxBufferedMs.toFixed(0)}ms buffer=${overlayBuffer.size} overlay=${overlay ? JSON.stringify({cars:overlay.cars_in_frame, persons:overlay.persons_in_frame}) : 'null'}`);
       }
 
       requestAnimationFrame(animate);
@@ -194,22 +229,29 @@
       ws.onopen = () => {
         wsStatus.textContent = 'WS: live';
         wsStatus.classList.add('connected');
-        statusBadge.textContent = 'Processing';
-        statusBadge.className = 'badge badge-live';
+        // Keep badge-buffer or badge-wait until overlays start arriving.
         wsRetries = 0;
       };
 
       ws.onmessage = (e) => {
         const payload = JSON.parse(e.data);
         if (payload._done) {
+          processingDone = true;
           statusBadge.textContent = 'Done';
           statusBadge.className = 'badge badge-done';
           wsStatus.textContent = 'WS: done';
           wsStatus.classList.remove('connected');
           infoBox.textContent = `Processing complete. ${payload.total_frames} frames analysed.`;
+          // All overlays are in the buffer — let the video play freely.
+          if (vid.paused) vid.play().catch(() => {});
           return;
         }
         addOverlay(payload);
+        // Update badge to "Processing" on first overlay received.
+        if (statusBadge.className.includes('buffer') || statusBadge.className.includes('wait')) {
+          statusBadge.textContent = 'Processing';
+          statusBadge.className = 'badge badge-live';
+        }
       };
 
       ws.onclose = () => {

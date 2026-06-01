@@ -19,6 +19,11 @@ GROUP_ID = os.environ["GROUP_ID"]           # tracker-car or tracker-person
 MAX_DISAPPEARED = int(os.environ.get("MAX_DISAPPEARED", "30"))
 MAX_DISTANCE = float(os.environ.get("MAX_DISTANCE", "100"))
 
+# CPU YOLOv8n throughput estimate — same value used by web/main.py to schedule _done.
+# Delays state cleanup so the seen set outlives the detection pipeline.
+DETECTION_FPS_ESTIMATE: float = float(os.environ.get("DETECTION_FPS_ESTIMATE", "5"))
+MIN_CLEANUP_DELAY_S: float = 30.0
+
 # {session_id: CentroidTracker}
 trackers: dict[str, CentroidTracker] = {}
 # {session_id: set of seen track_ids} for per-session unique count
@@ -67,7 +72,7 @@ def handle_session_end(payload: dict) -> None:
     total_frames = payload.get("total_frames", 0)
     # control.session_end arrives ~8s after upload; CPU detection takes ~total_frames/5 s.
     # Cleaning up immediately resets the seen set mid-stream → total_unique ≈ in_frame.
-    delay = max(30.0, total_frames / 5.0)
+    delay = max(MIN_CLEANUP_DELAY_S, total_frames / DETECTION_FPS_ESTIMATE)
 
     def _cleanup() -> None:
         trackers.pop(session_id, None)

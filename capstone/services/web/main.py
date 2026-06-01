@@ -24,6 +24,12 @@ STATS_URL = os.environ.get("STATS_URL", "http://statistics:8002/stats")
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/uploads"))
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 
+# CPU YOLOv8n throughput on typical hardware.  Used to estimate how long the
+# detection pipeline needs after the generator finishes emitting frames.
+# formula: delay = max(MIN_DONE_DELAY_S, total_frames / DETECTION_FPS_ESTIMATE)
+DETECTION_FPS_ESTIMATE: float = float(os.environ.get("DETECTION_FPS_ESTIMATE", "5"))
+MIN_DONE_DELAY_S: float = 30.0
+
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI()
@@ -74,7 +80,7 @@ def _schedule_done_signal(session_id: str, total_frames: int) -> None:
     process.  Dispatching _done immediately closes the WebSocket before all tracking
     messages arrive.  We schedule the dispatch after max(30, total_frames / 5) seconds.
     """
-    delay = max(30.0, total_frames / 5.0)
+    delay = max(MIN_DONE_DELAY_S, total_frames / DETECTION_FPS_ESTIMATE)
 
     def _send_done() -> None:
         done_item = {"_done": True, "total_frames": total_frames}
