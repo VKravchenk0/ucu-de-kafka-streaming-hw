@@ -183,12 +183,9 @@ Pre-trained COCO 80-class model, nano variant (~6 MB weights).
 {
   "sessions": {
     "aaa-bbb": {"unique_cars": 5, "unique_persons": 12, "status": "done"}
-  },
-  "global": {"unique_cars": 8, "unique_persons": 20}
+  }
 }
 ```
-
-Global counts use `(session_id, track_id)` tuples — track IDs reset to 0 per session.
 
 ---
 

@@ -28,9 +28,6 @@ class SessionStats:
 
 _lock = threading.Lock()
 sessions: dict[str, SessionStats] = {}
-# Global unique counts use (session_id, track_id) tuples — track IDs restart per session
-global_cars: set[tuple[str, int]] = set()
-global_persons: set[tuple[str, int]] = set()
 
 
 def get_session(session_id: str) -> SessionStats:
@@ -52,13 +49,9 @@ def handle_combined(session_id: str, payload: dict) -> None:
     with _lock:
         s = get_session(session_id)
         for t in payload.get("car_tracks") or []:
-            tid = t["track_id"]
-            s.car_ids.add(tid)
-            global_cars.add((session_id, tid))
+            s.car_ids.add(t["track_id"])
         for t in payload.get("person_tracks") or []:
-            tid = t["track_id"]
-            s.person_ids.add(tid)
-            global_persons.add((session_id, tid))
+            s.person_ids.add(t["track_id"])
 
 
 def handle_session_end(payload: dict) -> None:
@@ -103,10 +96,6 @@ def get_stats() -> JSONResponse:
                     "status": s.status,
                 }
                 for sid, s in sessions.items()
-            },
-            "global": {
-                "unique_cars": len(global_cars),
-                "unique_persons": len(global_persons),
             },
         }
     return JSONResponse(result)

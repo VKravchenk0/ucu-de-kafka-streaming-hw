@@ -64,12 +64,6 @@
         <div class="stat-row"><span class="label">People total</span><span class="value person" id="persons-total">—</span></div>
       </div>
 
-      <div class="stat-group">
-        <h3>Global (all sessions)</h3>
-        <div class="stat-row"><span class="label">Unique cars</span><span class="value car" id="g-cars">—</span></div>
-        <div class="stat-row"><span class="label">Unique people</span><span class="value person" id="g-persons">—</span></div>
-      </div>
-
       <div class="info" id="info-box">
         Video is loading. Detection boxes will appear within a few seconds after the pipeline processes the first frames.
       </div>
@@ -233,16 +227,6 @@
     // -----------------------------------------------------------------------
     // Global stats polling (every 3 seconds)
     // -----------------------------------------------------------------------
-    async function pollStats() {
-      try {
-        const r = await fetch('/stats');
-        const data = await r.json();
-        setEl('g-cars',    data.global?.unique_cars    ?? '—');
-        setEl('g-persons', data.global?.unique_persons ?? '—');
-      } catch (_) {}
-    }
-    pollStats();
-    setInterval(pollStats, 3000);
   </script>
 </body>
 </html>
