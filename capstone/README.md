@@ -1,329 +1,285 @@
-# Capstone: E2E Video Stream Processing Pipeline
+# Capstone: E2E Video Analytics Pipeline
 
-Kafka-based video pipeline that accepts uploaded videos, detects and tracks cars and people using YOLOv8, overlays bounding boxes on the live stream, and reports per-session and global unique-object statistics. Supports multiple simultaneous uploads from different browsers.
+Real-time car and person detection/tracking pipeline built on Apache Kafka. Upload a video in the browser, watch it play with bounding box overlays, and see live statistics — before the full video has been processed.
 
 ---
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    subgraph Browser
+        direction TB
+        VID["&lt;video&gt; plays /video/{sid}"]
+        CVS["&lt;canvas&gt; overlay\n(requestAnimationFrame)"]
+        WS["WebSocket /ws/{sid}"]
+        VID -.sync by timestamp.-> CVS
+        WS -->|overlay JSON| CVS
+    end
+
+    subgraph Web[":8080 web"]
+        direction TB
+        UP["POST /upload"]
+        STORE["_overlay_store\n(durable per-session list)"]
+        SUBS["_subscribers\n(fan-out queues)"]
+        WE["websocket_endpoint\ncatch-up + live stream"]
+        OVG["kafka_consumer_thread\nweb-overlay-group"]
+        UP -->|produce| CU
+        OVG -->|_dispatch| STORE
+        OVG -->|_dispatch| SUBS
+        SUBS --> WE
+        STORE -->|catch-up replay| WE
+        WE <--> WS
+    end
+
+    subgraph Kafka
+        CU["control.upload"]
+        FR["frames.raw"]
+        FP["frames.preprocessed"]
+        DC["detections.cars"]
+        DP["detections.persons"]
+        TC["tracking.cars"]
+        TP["tracking.persons"]
+        SE["control.session_end"]
+        TCO["tracking.combined\n(ksqlDB join)"]
+    end
+
+    subgraph Pipeline
+        GEN["generator"]
+        PRE["preprocessor"]
+        CAR["car-detector\nYOLOv8n cls=2,5,7"]
+        PER["person-detector\nYOLOv8n cls=0"]
+        CT["car-tracker\nCentroidTracker"]
+        PT["person-tracker\nCentroidTracker"]
+        STAT[":8002 statistics"]
+    end
+
+    Browser -->|upload| UP
+    CU --> GEN
+    GEN --> FR
+    GEN --> SE
+    FR --> PRE
+    PRE --> FP
+    FP --> CAR
+    FP --> PER
+    CAR --> DC
+    PER --> DP
+    DC --> CT
+    DP --> PT
+    CT --> TC
+    PT --> TP
+    TC --> OVG
+    TP --> OVG
+    SE --> OVG
+    TC --> TCO
+    TP --> TCO
+    TCO --> STAT
+    SE --> STAT
+    STAT -->|GET /stats| Web
 ```
-Browser ──── POST /upload ────────────────────────────────────────────────┐
-             GET  /view/{session_id}  (MJPEG stream + live stats)         │
-             GET  /stream/{session_id}                                     │
-             GET  /stats                                                   │
-                                                                           ▼
-                                                                    ┌────────────┐
-                                                                    │    web     │
-                                                                    │  :8080     │
-                                                                    └──────┬─────┘
-                                                     stats proxy           │  saves file to /uploads volume
-                                                  ┌──────────────────      │  publishes control.upload
-                                                  ▼                        ▼
-                                         ┌──────────────┐     topic: control.upload
-                                         │  statistics  │         {session_id, file_path}
-                                         │  :8002/stats │                  │
-                                         └──────┬───────┘                  ▼
-                                                │                    ┌─────────────┐
-                                                │                    │  generator  │
-                                                │                    │  (threaded) │
-                                                │                    └──────┬──────┘
-                                                │                           │ frames.raw
-                                                │                           │ {session_id, frame_number, ...}
-                                                │                           ▼
-                                                │                    ┌──────────────┐
-                                                │                    │ preprocessor │
-                                                │                    │ resize 640²  │
-                                                │                    └──────┬───────┘
-                                                │                           │ frames.preprocessed
-                                                │                    ┌──────┴──────┐
-                                                │                    ▼             ▼
-                                                │             ┌────────────┐ ┌──────────────┐
-                                                │             │car-detector│ │person-detect.│
-                                                │             │ YOLOv8n   │ │  YOLOv8n     │
-                                                │             │ cls 2,5,7 │ │  cls 0       │
-                                                │             └─────┬──────┘ └──────┬───────┘
-                                                │                   │               │
-                                                │        detections.cars   detections.persons
-                                                │                   │               │
-                                                │             ┌─────┴──────┐ ┌──────┴───────┐
-                                                │             │ car-tracker│ │person-tracker│
-                                                │             │ {sid:      │ │ {sid:        │
-                                                │             │  Tracker}  │ │  Tracker}    │
-                                                │             └─────┬──────┘ └──────┬───────┘
-                                                │                   │               │
-                                                │         tracking.cars    tracking.persons
-                                                │            │      │          │      │
-                                                └────────────┘      └──────────┘      │
-                                            (per-session +                  ▼
-                                             global stats)           ┌─────────────┐
-                                                                     │  renderer   │
-                                                            frames.  │ joins frame │
-                                                         preprocessed│ + cars      │
-                                                              ──────►│ + persons   │
-                                                                     │ draws boxes │
-                                                                     └──────┬──────┘
-                                                                            │ frames.rendered
-                                                                            ▼
-                                                                    ┌────────────┐
-                                                                    │    web     │
-                                                                    │ /stream/   │
-                                                                    │ {session}  │
-                                                                    └──────┬─────┘
-                                                                           │ MJPEG
-                                                                           ▼
-                                                                        Browser
+
+---
+
+## Overlay synchronization detail
+
+```mermaid
+sequenceDiagram
+    participant G as Generator
+    participant K as Kafka (tracking.*)
+    participant W as Web service
+    participant B as Browser
+
+    G->>K: tracking.cars {session_id, video_timestamp_ms, tracks}
+    G->>K: tracking.persons {session_id, video_timestamp_ms, tracks}
+    K->>W: kafka_consumer_thread polls both topics
+    W->>W: merge by video_timestamp_ms → _overlay_store
+    W->>W: fan-out to _subscribers[session_id]
+    W->>B: WebSocket sends overlay JSON
+    B->>B: overlayBuffer.set(video_timestamp_ms, payload)
+    B->>B: requestAnimationFrame: findClosestOverlay(video.currentTime * 1000)
+    B->>B: drawBoxes() on <canvas>
 ```
+
+Sync is by **`video_timestamp_ms`** (milliseconds from start of video file, set by OpenCV `cap.get(CAP_PROP_POS_MSEC)`). The browser searches for the buffered overlay whose timestamp is closest to `video.currentTime * 1000`, within a 2-second tolerance.
+
+Because the detection pipeline runs faster than playback speed, all overlays for the whole video arrive at the browser before the video finishes playing. The browser stores them all in `overlayBuffer` (a `Map<ms, payload>`) and looks up the right one each animation frame.
+
+---
+
+## WebSocket connection lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Connecting: browser opens /ws/{sid}
+    Connecting --> CatchUp: websocket accepted\nregister subscriber queue
+    CatchUp --> LiveStream: replay _overlay_store (all frames so far)
+    LiveStream --> LiveStream: new overlay arrives via Kafka
+    LiveStream --> Done: _done received (session_end)
+    Done --> [*]: WS closes, subscriber queue removed\n_overlay_store KEPT
+    LiveStream --> Closed: disconnect or 60s timeout
+    Closed --> [*]: subscriber queue removed\n_overlay_store KEPT
+
+    note right of CatchUp: Second user or page reload\ngets instant full replay
+```
+
+`_overlay_store` is never deleted (within a web process lifetime). A second user or page reload immediately replays all stored overlays, then continues live.
 
 ---
 
 ## Services
 
-| Service | Profile | Port | Image | Description |
-|---|---|---|---|---|
-| `topic-init` | app | — | 138 MB | One-shot: creates all 9 Kafka topics, then exits |
-| `generator` | app | — | 563 MB | Listens on `control.upload`; processes each video in its own thread; embeds `session_id` in every frame |
-| `preprocessor` | app | — | 563 MB | Resizes frames to 640×640, forwards `session_id` |
-| `car-detector` | app | — | 1.9 GB | YOLOv8n CPU, COCO classes {2=car, 5=bus, 7=truck} |
-| `person-detector` | app | — | 1.9 GB | YOLOv8n CPU (same image), COCO class {0=person} |
-| `car-tracker` | app | — | 138 MB | Per-session centroid tracker; cleans up on `control.session_end` |
-| `person-tracker` | app | — | 138 MB | Same image, different `OBJECT_TYPE` env var |
-| `statistics` | app | 8002 | 138 MB | Per-session + global unique counts; HTTP `GET /stats` |
-| `renderer` | app | — | 563 MB | Joins `frames.preprocessed + tracking.cars + tracking.persons` by `(session_id, frame_number)`; draws colour boxes; publishes to `frames.rendered` |
-| `web` | app | 8080 | 138 MB | Upload form; MJPEG `/stream/{session_id}`; `/stats` proxy |
-
-Infra services (broker ×3, schema-registry, connect, ksqlDB, REST proxy, Prometheus, AlertManager, Control Center, Flink) are under the `infra` profile.
-
----
-
-## Multi-session design
-
-Every Kafka message carries `"session_id": "<uuid>"` as both a JSON field and the Kafka **message key**. Kafka routes by `hash(session_id) → partition`, so all messages for one session always land on the same partition — per-session ordering is guaranteed without coordination.
-
-Stateful services maintain per-session state dicts:
-
-- **Trackers** — `{session_id: CentroidTracker}`. A new tracker is created lazily on the first detection message for an unknown session. When `control.session_end` arrives, that tracker is removed.
-- **Renderer** — `{(session_id, frame_number): {"frame", "cars", "persons"}}`. Renders when all three slots are filled; evicts on session end or buffer overflow.
-- **Statistics** — `{session_id: Stats}` + global set of `(session_id, track_id)` pairs (track IDs reset to 0 per session, so raw IDs are only unique within a session).
+| Container | Port | Role |
+|---|---|---|
+| `topic-init` | — | One-shot: creates 8 Kafka topics; exits 0 |
+| `ksql-init` | — | One-shot: creates ksqlDB streams + LEFT JOIN on tracking topics; exits 0 |
+| `generator` | — | Reads uploaded video frame-by-frame → `frames.raw`; emits `control.session_end` |
+| `preprocessor` | — | Resizes frames to 640×640 → `frames.preprocessed` |
+| `car-detector` | — | YOLOv8n class IDs 2,5,7 → `detections.cars` (shared image with person-detector) |
+| `person-detector` | — | YOLOv8n class ID 0 → `detections.persons` |
+| `car-tracker` | — | CentroidTracker → `tracking.cars` (shared image with person-tracker) |
+| `person-tracker` | — | CentroidTracker → `tracking.persons` |
+| `statistics` | 8002 | Consumes `tracking.combined` (ksqlDB output); FastAPI `GET /stats` |
+| `web` | 8080 | Upload, video serve, WebSocket overlay stream, UI |
+| ksqlDB (infra) | 8088 | Joins `tracking.cars` + `tracking.persons` → `tracking.combined` |
 
 ---
 
-## Neural Network
+## Neural Network: YOLOv8n (CPU)
 
-**YOLOv8n (Ultralytics, CPU-only PyTorch)**
+Pre-trained COCO 80-class model, nano variant (~6 MB weights).
 
-- Pre-trained on COCO 80-class dataset — covers all required objects out of the box.
-- Nano variant: ~3 MB weights, ~30–80 ms/frame on CPU.
-- Installed as: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu` then `pip install ultralytics`. The CPU index must come first, otherwise pip resolves the GPU build (~1.5 GB extra).
-- Car detector uses `CLASS_IDS=2,5,7`; person detector uses `CLASS_IDS=0` — same Docker image, different env var.
+| Class IDs | Objects |
+|---|---|
+| 0 | person |
+| 2, 5, 7 | car, bus, truck |
 
-**Centroid tracking** (pure Python, `common/centroid_tracker.py`)
-
-- `{track_id → centroid}` in memory per session.
-- Greedy distance matching (threshold 100 px) + max-disappeared counter (30 frames).
-- `total_seen == next_id` gives unique object count for the session.
+**Tracking:** CentroidTracker — distance-matrix greedy matching, 30-frame disappear window, no GPU required.
 
 ---
 
 ## Kafka Topics
 
-| Topic | Partitions | Max msg | Key | Notes |
+| Topic | Partitions | Max message | Key | Producer |
 |---|---|---|---|---|
-| `frames.raw` | 3 | 5 MB | `session_id` | JPEG frames from generator |
-| `frames.preprocessed` | 3 | 5 MB | `session_id` | Resized 640×640 |
-| `frames.rendered` | 3 | 5 MB | `session_id` | Annotated JPEG from renderer |
-| `detections.cars` | 3 | 256 KB | `session_id` | Car/bus/truck bboxes |
-| `detections.persons` | 3 | 256 KB | `session_id` | Person bboxes |
-| `tracking.cars` | 3 | 256 KB | `session_id` | Car tracks with unique IDs |
-| `tracking.persons` | 3 | 256 KB | `session_id` | Person tracks with unique IDs |
-| `control.upload` | 1 | 4 KB | `session_id` | `{session_id, file_path}` trigger |
-| `control.session_end` | 1 | 4 KB | `session_id` | Emitted by generator when video is done |
+| `frames.raw` | 3 | 5 MB | session_id | generator |
+| `frames.preprocessed` | 3 | 5 MB | session_id | preprocessor |
+| `detections.cars` | 3 | 256 KB | session_id | car-detector |
+| `detections.persons` | 3 | 256 KB | session_id | person-detector |
+| `tracking.cars` | 3 | 256 KB | session_id | car-tracker |
+| `tracking.persons` | 3 | 256 KB | session_id | person-tracker |
+| `control.upload` | 1 | 4 KB | session_id | web |
+| `control.session_end` | 1 | 4 KB | session_id | generator |
+| `tracking.combined` (ksqlDB) | 3 | — | session_id | ksqlDB stream join |
 
----
-
-## Message Schemas
-
-**frames.raw / frames.preprocessed / frames.rendered**
-```json
-{"session_id": "uuid", "frame_number": 42, "timestamp": 1748452800.0,
- "width": 640, "height": 640, "data": "<base64 JPEG>"}
-```
-
-**detections.cars / detections.persons**
-```json
-{"session_id": "uuid", "frame_number": 42, "timestamp": 1748452800.0,
- "detections": [{"bbox": [x1,y1,x2,y2], "confidence": 0.87, "class_id": 2, "class_name": "car"}]}
-```
-
-**tracking.cars / tracking.persons**
-```json
-{"session_id": "uuid", "frame_number": 42, "object_type": "car",
- "tracks": [{"track_id": 3, "bbox": [x1,y1,x2,y2]}], "total_unique": 15}
-```
-
-**control.upload**
-```json
-{"session_id": "uuid", "file_path": "/uploads/uuid_filename.mp4"}
-```
-
-**control.session_end**
-```json
-{"session_id": "uuid", "total_frames": 704}
-```
+`session_id` (UUID) as Kafka key → `hash(session_id) % 3` routes all messages for one session to the same partition, preserving per-session ordering without coordination.
 
 ---
 
 ## Statistics API
 
-`GET http://localhost:8002/stats` (also proxied via `GET http://localhost:8080/stats`)
+`GET http://localhost:8002/stats` (also proxied at `GET http://localhost:8080/stats`)
 
 ```json
 {
   "sessions": {
-    "aaa-bbb": {"unique_cars": 5, "unique_persons": 12, "frames_cars": 704, "frames_persons": 704, "status": "done"},
-    "ccc-ddd": {"unique_cars": 3, "unique_persons": 8,  "frames_cars": 210, "frames_persons": 210, "status": "processing"}
+    "aaa-bbb": {"unique_cars": 5, "unique_persons": 12, "status": "done"}
   },
   "global": {"unique_cars": 8, "unique_persons": 20}
 }
 ```
 
-Global counts deduplicate as `(session_id, track_id)` pairs because each session's `CentroidTracker` resets IDs from 0.
+Global counts use `(session_id, track_id)` tuples — track IDs reset to 0 per session.
 
 ---
 
-## How to Run
+## Quickstart
 
-### Prerequisites
-
-- Docker + Docker Compose v2
-- ~8 GB free disk (detector images are ~1.9 GB each; two of them)
-- ~4 GB RAM for all services
-
-### Mode 1 — Full Docker (recommended)
+### Full Docker Compose
 
 ```bash
 cd capstone
-
-# Step 1: start Kafka infrastructure
 docker compose --profile infra up -d
-
-# Step 2: build app images (first time only, ~5 min)
-docker compose --profile app build
-
-# Step 3: create topics (one-shot, idempotent)
-docker compose --profile app up topic-init
-
-# Step 4: start all app services
-docker compose --profile app up -d --no-recreate
-
-# Open the web UI
-open http://localhost:8080
+docker compose --profile app build --no-cache     # first time: ~5–10 min (downloads torch)
+docker compose --profile app up -d
+# open http://localhost:8080
 ```
 
-### Mode 2 — Hybrid (infra in Docker, apps run manually)
+### Hybrid (infra in Docker, services run manually)
 
 ```bash
-cd capstone
 docker compose --profile infra up -d
-
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install confluent-kafka opencv-python-headless fastapi uvicorn \
-            python-multipart httpx jinja2
+cd services
+pip install confluent-kafka fastapi uvicorn python-multipart httpx jinja2 aiofiles websockets
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install ultralytics
-
-export KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-export PYTHONPATH=services
-mkdir -p /tmp/uploads
-
-python services/topic_init/main.py
-
-python services/generator/main.py &
-python services/preprocessor/main.py &
-
-CLASS_IDS=2,5,7 OUTPUT_TOPIC=detections.cars  GROUP_ID=detector-cars    python services/detector/main.py &
-CLASS_IDS=0     OUTPUT_TOPIC=detections.persons GROUP_ID=detector-persons python services/detector/main.py &
-
-OBJECT_TYPE=car    INPUT_TOPIC=detections.cars    OUTPUT_TOPIC=tracking.cars    python services/tracker/main.py &
-OBJECT_TYPE=person INPUT_TOPIC=detections.persons OUTPUT_TOPIC=tracking.persons python services/tracker/main.py &
-
-python services/statistics/main.py &
-python services/renderer/main.py &
-
-UPLOAD_DIR=/tmp/uploads python services/web/main.py
+export KAFKA_BOOTSTRAP_SERVERS=localhost:9092 PYTHONPATH=.
+python topic_init/main.py
+KSQLDB_URL=http://localhost:8088 python ksql_init/main.py
+python generator/main.py &
+python preprocessor/main.py &
+CLASS_IDS=2,5,7 OUTPUT_TOPIC=detections.cars  GROUP_ID=detector-cars    python detector/main.py &
+CLASS_IDS=0     OUTPUT_TOPIC=detections.persons GROUP_ID=detector-persons python detector/main.py &
+OBJECT_TYPE=car    INPUT_TOPIC=detections.cars    OUTPUT_TOPIC=tracking.cars    GROUP_ID=tracker-car    python tracker/main.py &
+OBJECT_TYPE=person INPUT_TOPIC=detections.persons OUTPUT_TOPIC=tracking.persons GROUP_ID=tracker-person python tracker/main.py &
+python statistics/main.py &
+UPLOAD_DIR=/tmp/uploads python web/main.py
 ```
 
-Then open `http://localhost:8080`.
-
 ---
 
-## Environment Variables
-
-All services read `KAFKA_BOOTSTRAP_SERVERS` (default: `broker:29092`; override to `localhost:9092` for hybrid).
-
-| Service | Variable | Default | Description |
-|---|---|---|---|
-| generator | `CONTROL_TOPIC` | `control.upload` | Topic to listen for upload events |
-| generator | `FRAME_INTERVAL` | `1` | Send every Nth frame |
-| generator | `TARGET_WIDTH/HEIGHT` | `640/480` | Output frame resolution |
-| preprocessor | `TARGET_WIDTH/HEIGHT` | `640/640` | YOLO input size |
-| detector | `CLASS_IDS` | `2,5,7` | COCO class IDs to keep |
-| detector | `CONFIDENCE` | `0.4` | Minimum detection confidence |
-| tracker | `MAX_DISAPPEARED` | `30` | Frames before a track is dropped |
-| tracker | `MAX_DISTANCE` | `100` | Pixel radius for centroid match |
-| renderer | `MAX_BUFFER_ENTRIES` | `300` | Max `(session_id, frame_number)` entries before eviction |
-| statistics | `HTTP_PORT` | `8002` | Port for the `/stats` HTTP endpoint |
-| web | `UPLOAD_DIR` | `/uploads` | Where uploaded videos are saved |
-| web | `STATS_URL` | `http://statistics:8002/stats` | Statistics service endpoint |
-| web | `HTTP_PORT` | `8080` | Web server port |
-
----
-
-## Verifying the Pipeline
+## Rebuild a single service
 
 ```bash
-# List all pipeline topics
-docker exec broker kafka-topics --bootstrap-server broker:29092 --list
-
-# Check consumer group lag (all groups should be active)
-docker exec broker kafka-consumer-groups \
-  --bootstrap-server broker:29092 --all-groups --describe
-
-# Statistics HTTP API
-curl http://localhost:8002/stats | python3 -m json.tool
-
-# Web UI
-open http://localhost:8080
-
-# Service logs
-docker compose --profile app logs -f renderer
-docker compose --profile app logs -f statistics
+docker compose --profile app build --no-cache <service-name>
+docker compose --profile app up -d --no-recreate
 ```
 
 ---
 
-## Directory Structure
+## Verification
+
+```bash
+# 8 application topics created
+docker exec broker kafka-topics --bootstrap-server broker:29092 --list
+
+# ksqlDB join stream exists
+curl -s http://localhost:8088/ksql \
+  -H 'Content-Type: application/vnd.ksql.v1+json' \
+  -d '{"ksql":"LIST STREAMS;"}' | python3 -m json.tool
+
+# Statistics
+curl -s http://localhost:8002/stats | python3 -m json.tool
+
+# Consumer group lag
+docker exec broker kafka-consumer-groups \
+  --bootstrap-server broker:29092 --all-groups --describe
+```
+
+---
+
+## Project Structure
 
 ```
 capstone/
-├── docker-compose.yaml          # infra (profile: infra) + 10 app services (profile: app)
-├── input.mp4                    # sample video (can be uploaded via web UI too)
+├── docker-compose.yaml      # profile: infra (Kafka stack) + profile: app (pipeline)
+├── input.mp4                # sample test video
 ├── README.md
 └── services/
     ├── common/
-    │   ├── kafka_client.py      # producer/consumer factory + produce_with_backpressure()
-    │   └── centroid_tracker.py  # per-session centroid tracker
+    │   ├── kafka_client.py      # make_producer, make_consumer, produce_with_backpressure
+    │   └── centroid_tracker.py  # CentroidTracker
+    ├── topic_init/              # Dockerfile  main.py  requirements.txt
+    ├── ksql_init/               # Dockerfile  main.py  requirements.txt
     ├── generator/               # Dockerfile  main.py  requirements.txt
     ├── preprocessor/            # Dockerfile  main.py  requirements.txt
-    ├── detector/                # shared image for car-detector + person-detector
-    ├── tracker/                 # shared image for car-tracker + person-tracker
+    ├── detector/                # shared image: car-detector + person-detector
+    ├── tracker/                 # shared image: car-tracker + person-tracker
     ├── statistics/              # Dockerfile  main.py  requirements.txt
-    ├── renderer/                # Dockerfile  main.py  requirements.txt
-    ├── web/
-    │   ├── Dockerfile
-    │   ├── main.py
-    │   ├── requirements.txt
-    │   └── templates/
-    │       ├── index.html       # upload form
-    │       └── view.html        # MJPEG viewer + live stats
-    └── topic_init/              # Dockerfile  main.py  requirements.txt
+    └── web/
+        ├── Dockerfile
+        ├── main.py
+        ├── requirements.txt
+        └── templates/
+            ├── index.html       # upload form
+            └── view.html        # HTML5 video + canvas overlay + live stats
 ```

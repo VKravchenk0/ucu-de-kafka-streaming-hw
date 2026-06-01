@@ -1,94 +1,190 @@
-"""Web service: upload form, live MJPEG stream per session, stats proxy.
-
-Endpoints:
-  GET  /                    — upload form
-  POST /upload              — save file, publish to control.upload, return session_id
-  GET  /view/{session_id}   — viewer page (MJPEG + live stats)
-  GET  /stream/{session_id} — MJPEG multipart stream (consumed by <img> tag)
-  GET  /stats               — proxies GET http://statistics:8002/stats
-"""
-
 import asyncio
-import base64
 import json
 import logging
 import os
-import sys
 import threading
 import uuid
+from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from fastapi import Request
+import aiofiles
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.kafka_client import make_producer, make_consumer, produce_with_backpressure
+from common.kafka_client import make_consumer, make_producer, produce_with_backpressure
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/uploads")
-KAFKA_UPLOAD_TOPIC = os.environ.get("KAFKA_UPLOAD_TOPIC", "control.upload")
-RENDERED_TOPIC = os.environ.get("RENDERED_TOPIC", "frames.rendered")
+BOOTSTRAP = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 STATS_URL = os.environ.get("STATS_URL", "http://statistics:8002/stats")
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/uploads"))
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI()
-templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+templates = Jinja2Templates(directory="templates")
 
-# session_id → asyncio.Queue[bytes]  (JPEG frame bytes)
-_frame_queues: dict[str, asyncio.Queue] = {}
-_event_loop: asyncio.AbstractEventLoop | None = None
-_producer = None
+# ---------------------------------------------------------------------------
+# Durable per-session overlay store
+# ---------------------------------------------------------------------------
+# _overlay_store  — accumulates all overlay dicts as they arrive; never deleted
+# _session_done   — True once control.session_end is received for that session
+# _subscribers    — per-connection asyncio.Queue; one per active WebSocket
+# All three are accessed from both the Kafka thread and async handlers → use locks.
+
+_overlay_store: dict[str, list[dict]] = {}
+_session_done:  dict[str, bool]       = {}
+_subscribers:   dict[str, list[asyncio.Queue]] = {}
+
+_store_lock       = threading.Lock()
+_subscribers_lock = threading.Lock()
+
+# The main event loop (set on startup, used for thread → async handoff)
+_loop: asyncio.AbstractEventLoop | None = None
 
 
-# ── background Kafka consumer for rendered frames ────────────────────────────
+def _dispatch(session_id: str, item: dict) -> None:
+    """Persist overlay to store and fan-out to every active WebSocket for this session."""
+    with _store_lock:
+        _overlay_store.setdefault(session_id, []).append(item)
 
-def _kafka_rendered_loop() -> None:
-    consumer = make_consumer("web-stream-group", [RENDERED_TOPIC])
+    if _loop is None:
+        return
+
+    with _subscribers_lock:
+        for q in _subscribers.get(session_id, []):
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            asyncio.run_coroutine_threadsafe(q.put(item), _loop)
+
+
+def _schedule_done_signal(session_id: str, total_frames: int) -> None:
+    """Delay the _done signal so the detection pipeline has time to finish.
+
+    control.session_end is produced by the generator when it finishes emitting frames
+    (~8 s), but CPU detection runs at ~5 fps so a 695-frame video takes ~139 s to fully
+    process.  Dispatching _done immediately closes the WebSocket before all tracking
+    messages arrive.  We schedule the dispatch after max(30, total_frames / 5) seconds.
+    """
+    delay = max(30.0, total_frames / 5.0)
+
+    def _send_done() -> None:
+        done_item = {"_done": True, "total_frames": total_frames}
+        with _store_lock:
+            _session_done[session_id] = True
+        if _loop is None:
+            return
+        with _subscribers_lock:
+            for q in _subscribers.get(session_id, []):
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                asyncio.run_coroutine_threadsafe(q.put(done_item), _loop)
+        logger.info("session=%s  _done dispatched  total_frames=%d", session_id, total_frames)
+
+    t = threading.Timer(delay, _send_done)
+    t.daemon = True
+    t.start()
+    logger.info("session=%s  _done scheduled in %.0fs  total_frames=%d", session_id, delay, total_frames)
+
+
+# ---------------------------------------------------------------------------
+# Kafka consumer thread
+# ---------------------------------------------------------------------------
+
+def kafka_consumer_thread() -> None:
+    # Consume tracking.cars and tracking.persons directly — bypasses ksqlDB windowed
+    # join delays that caused most frames to be absent from tracking.combined.
+    # ksqlDB / tracking.combined is still consumed by the statistics service.
+    consumer = make_consumer(
+        BOOTSTRAP,
+        ["tracking.cars", "tracking.persons", "control.session_end"],
+        "web-overlay-group",
+    )
+    logger.info("Web Kafka consumer started (direct tracking topics)")
+
+    # Merge buffer: session_id → {video_timestamp_ms → combined overlay dict}
+    # Cars and persons for the same frame update the same entry; dispatch on each update.
+    merge_buf: dict[str, dict[float, dict]] = {}
+
     while True:
         msg = consumer.poll(1.0)
-        if msg is None:
-            continue
-        if msg.error():
-            logger.warning("Rendered consumer error: %s", msg.error())
+        if msg is None or msg.error():
             continue
         try:
-            envelope = json.loads(msg.value())
-            sid = envelope.get("session_id", "")
-            q = _frame_queues.get(sid)
-            if q and _event_loop:
-                frame_bytes = base64.b64decode(envelope["data"])
-                asyncio.run_coroutine_threadsafe(_put_frame(q, frame_bytes), _event_loop)
-        except Exception as exc:
-            logger.warning("Frame dispatch error: %s", exc)
+            topic = msg.topic()
+            payload = json.loads(msg.value())
+            session_id = payload.get("session_id", "")
+
+            if topic == "control.session_end":
+                _schedule_done_signal(session_id, payload.get("total_frames", 0))
+                merge_buf.pop(session_id, None)
+                continue
+
+            ts = payload.get("video_timestamp_ms", 0.0)
+
+            if session_id not in merge_buf:
+                merge_buf[session_id] = {}
+            if ts not in merge_buf[session_id]:
+                merge_buf[session_id][ts] = {
+                    "session_id": session_id,
+                    "video_timestamp_ms": ts,
+                    "frame_number": payload.get("frame_number", 0),
+                    "car_tracks": [],
+                    "cars_in_frame": 0,
+                    "cars_total": 0,
+                    "person_tracks": [],
+                    "persons_in_frame": 0,
+                    "persons_total": 0,
+                }
+
+            entry = merge_buf[session_id][ts]
+            if topic == "tracking.cars":
+                entry["car_tracks"] = payload.get("tracks", [])
+                entry["cars_in_frame"] = payload.get("in_frame", 0)
+                entry["cars_total"] = payload.get("total_unique", 0)
+            else:
+                entry["person_tracks"] = payload.get("tracks", [])
+                entry["persons_in_frame"] = payload.get("in_frame", 0)
+                entry["persons_total"] = payload.get("total_unique", 0)
+
+            _dispatch(session_id, dict(entry))
+
+            # Cap memory: evict oldest entries beyond 10 000 per session
+            if len(merge_buf[session_id]) > 10_000:
+                oldest = min(merge_buf[session_id])
+                del merge_buf[session_id][oldest]
+
+        except Exception as e:
+            logger.error("Web consumer error: %s", e)
 
 
-async def _put_frame(q: asyncio.Queue, frame: bytes) -> None:
-    if q.full():
-        try:
-            q.get_nowait()  # drop the oldest frame so the stream stays live
-        except asyncio.QueueEmpty:
-            pass
-    await q.put(frame)
-
-
-# ── FastAPI lifecycle ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# FastAPI lifecycle
+# ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _event_loop, _producer
-    _event_loop = asyncio.get_event_loop()
-    _producer = make_producer()
-    threading.Thread(target=_kafka_rendered_loop, daemon=True, name="kafka-rendered").start()
-    logger.info("Web service ready on :%d", HTTP_PORT)
+    global _loop, _producer
+    _loop = asyncio.get_event_loop()
+    _producer = make_producer(BOOTSTRAP)
+    t = threading.Thread(target=kafka_consumer_thread, daemon=True)
+    t.start()
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -96,21 +192,28 @@ async def index(request: Request):
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile):
     session_id = str(uuid.uuid4())
-    safe_name = "".join(c for c in file.filename if c.isalnum() or c in "._-")
-    file_path = os.path.join(UPLOAD_DIR, f"{session_id}_{safe_name}")
+    dest = UPLOAD_DIR / f"{session_id}.mp4"
 
-    contents = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(contents)
+    async with aiofiles.open(dest, "wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            await f.write(chunk)
 
-    msg = json.dumps({"session_id": session_id, "file_path": file_path})
-    produce_with_backpressure(_producer, KAFKA_UPLOAD_TOPIC, session_id, msg)
+    msg = json.dumps({"session_id": session_id, "file_path": str(dest)}).encode()
+    produce_with_backpressure(_producer, "control.upload", session_id, msg)
     _producer.flush()
+    logger.info("Uploaded session=%s  file=%s", session_id, dest)
 
-    logger.info("Upload saved: session=%s  file=%s  size=%d", session_id[:8], safe_name, len(contents))
-    return JSONResponse({"session_id": session_id})
+    return RedirectResponse(f"/view/{session_id}", status_code=303)
+
+
+@app.get("/video/{session_id}")
+async def serve_video(session_id: str):
+    path = UPLOAD_DIR / f"{session_id}.mp4"
+    if not path.exists():
+        return HTMLResponse("Not found", status_code=404)
+    return FileResponse(str(path), media_type="video/mp4")
 
 
 @app.get("/view/{session_id}", response_class=HTMLResponse)
@@ -118,38 +221,62 @@ async def view(request: Request, session_id: str):
     return templates.TemplateResponse("view.html", {"request": request, "session_id": session_id})
 
 
-@app.get("/stream/{session_id}")
-async def stream(session_id: str):
-    if session_id not in _frame_queues:
-        _frame_queues[session_id] = asyncio.Queue(maxsize=60)
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await websocket.accept()
 
-    async def generate():
-        q = _frame_queues[session_id]
+    # Create a per-connection subscriber queue and register it BEFORE reading the
+    # store, so no items can slip through the gap between the two operations.
+    sub: asyncio.Queue = asyncio.Queue(maxsize=10_000)
+    with _subscribers_lock:
+        _subscribers.setdefault(session_id, []).append(sub)
+
+    try:
+        # Phase 1: catch-up — replay everything received so far for this session.
+        # This makes page-reload and multi-user scenarios work correctly.
+        with _store_lock:
+            existing = list(_overlay_store.get(session_id, []))
+            done     = _session_done.get(session_id, False)
+
+        for item in existing:
+            await websocket.send_text(json.dumps(item))
+
+        if done:
+            await websocket.send_text(json.dumps({"_done": True}))
+            return
+
+        # Phase 2: live stream — drain subscriber queue as new overlays arrive.
         while True:
-            try:
-                frame = await asyncio.wait_for(q.get(), timeout=30.0)
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-                )
-            except asyncio.TimeoutError:
-                # Send a keep-alive comment so the browser does not close the connection
-                yield b"--frame\r\n\r\n"
+            item = await asyncio.wait_for(sub.get(), timeout=300.0)
+            await websocket.send_text(json.dumps(item))
+            if item.get("_done"):
+                break
 
-    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    finally:
+        # Remove only the subscriber queue; the store is kept for future connections.
+        with _subscribers_lock:
+            subs = _subscribers.get(session_id, [])
+            if sub in subs:
+                subs.remove(sub)
+        logger.info("WebSocket closed  session=%s  stored=%d",
+                    session_id, len(_overlay_store.get(session_id, [])))
 
 
 @app.get("/stats")
 async def stats():
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(STATS_URL)
-            return JSONResponse(resp.json())
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=503)
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(STATS_URL, timeout=5.0)
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+def main() -> None:
+    uvicorn.run(app, host="0.0.0.0", port=HTTP_PORT, log_level="info")
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=HTTP_PORT, log_level="info")
+    main()

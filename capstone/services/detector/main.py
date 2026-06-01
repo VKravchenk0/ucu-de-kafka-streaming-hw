@@ -1,106 +1,84 @@
-"""Detector: runs YOLOv8n on preprocessed frames and publishes detections.
-
-Env vars:
-  CLASS_IDS    comma-separated COCO class IDs to keep (e.g. "2,5,7" for cars)
-  INPUT_TOPIC  (default: frames.preprocessed)
-  OUTPUT_TOPIC (default: detections.cars)
-  GROUP_ID     consumer group id
-  CONFIDENCE   minimum detection confidence (default: 0.4)
-"""
-
 import base64
 import json
 import logging
 import os
-import sys
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.kafka_client import make_producer, make_consumer, produce_with_backpressure
+from common.kafka_client import make_consumer, make_producer, produce_with_backpressure
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-CLASS_IDS = set(int(x) for x in os.environ.get("CLASS_IDS", "2,5,7").split(","))
-INPUT_TOPIC = os.environ.get("INPUT_TOPIC", "frames.preprocessed")
-OUTPUT_TOPIC = os.environ.get("OUTPUT_TOPIC", "detections.cars")
-GROUP_ID = os.environ.get("GROUP_ID", f"detector-{OUTPUT_TOPIC}")
-CONFIDENCE = float(os.environ.get("CONFIDENCE", "0.4"))
+BOOTSTRAP = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
+# CLASS_IDS: comma-separated COCO class IDs to detect
+#   car-detector:    CLASS_IDS=2,5,7  (car, bus, truck)
+#   person-detector: CLASS_IDS=0      (person)
+CLASS_IDS = [int(x) for x in os.environ["CLASS_IDS"].split(",")]
+OUTPUT_TOPIC = os.environ["OUTPUT_TOPIC"]   # detections.cars or detections.persons
+GROUP_ID = os.environ["GROUP_ID"]           # detector-cars or detector-persons
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.4"))
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolov8n.pt")
 
 COCO_NAMES = {
-    0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
-    5: "bus", 7: "truck", 9: "traffic light",
+    0: "person", 2: "car", 5: "bus", 7: "truck",
 }
 
 
-def decode_frame(data_b64: str) -> np.ndarray:
-    raw = base64.b64decode(data_b64)
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
-
-def detect(model: YOLO, img: np.ndarray) -> list[dict]:
-    results = model.predict(img, conf=CONFIDENCE, verbose=False)[0]
+def run_inference(frame: np.ndarray) -> list[dict]:
+    results = model.predict(frame, classes=CLASS_IDS, conf=CONF_THRESHOLD, verbose=False)
     detections = []
-    for box in results.boxes:
-        cls_id = int(box.cls[0])
-        if cls_id not in CLASS_IDS:
-            continue
-        x1, y1, x2, y2 = box.xyxy[0].tolist()
-        detections.append({
-            "bbox": [x1, y1, x2, y2],
-            "confidence": float(box.conf[0]),
-            "class_id": cls_id,
-            "class_name": COCO_NAMES.get(cls_id, str(cls_id)),
-        })
+    for r in results:
+        for box in r.boxes:
+            cls_id = int(box.cls[0])
+            x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
+            detections.append({
+                "bbox": [x1, y1, x2, y2],
+                "confidence": float(box.conf[0]),
+                "class_id": cls_id,
+                "class_name": COCO_NAMES.get(cls_id, str(cls_id)),
+            })
     return detections
 
 
+def process(msg_value: bytes, producer) -> None:
+    payload = json.loads(msg_value)
+    raw = base64.b64decode(payload["data"])
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return
+
+    detections = run_inference(frame)
+
+    out = json.dumps({
+        "session_id": payload["session_id"],
+        "frame_number": payload["frame_number"],
+        "video_timestamp_ms": payload["video_timestamp_ms"],
+        "detections": detections,
+    }).encode()
+    produce_with_backpressure(producer, OUTPUT_TOPIC, payload["session_id"], out)
+
+
 def main() -> None:
-    logger.info("Loading YOLO model: %s", MODEL_PATH)
+    global model
+    logger.info("Loading YOLOv8n model (class_ids=%s)…", CLASS_IDS)
     model = YOLO(MODEL_PATH)
-    logger.info("Detector ready — classes=%s  %s → %s", CLASS_IDS, INPUT_TOPIC, OUTPUT_TOPIC)
+    logger.info("Model loaded. Subscribing to frames.preprocessed …")
 
-    producer = make_producer()
-    consumer = make_consumer(GROUP_ID, [INPUT_TOPIC])
-    processed = 0
+    consumer = make_consumer(BOOTSTRAP, ["frames.preprocessed"], GROUP_ID)
+    producer = make_producer(BOOTSTRAP)
 
-    try:
-        while True:
-            msg = consumer.poll(timeout=1.0)
-            if msg is None:
-                continue
-            if msg.error():
-                logger.error("Consumer error: %s", msg.error())
-                continue
-
-            envelope = json.loads(msg.value())
-            session_id = envelope["session_id"]
-            img = decode_frame(envelope["data"])
-            dets = detect(model, img)
-
-            out = json.dumps({
-                "session_id": session_id,
-                "frame_number": envelope["frame_number"],
-                "timestamp": envelope["timestamp"],
-                "detections": dets,
-            })
-            produce_with_backpressure(producer, OUTPUT_TOPIC, session_id, out)
-            processed += 1
-
-            if processed % 50 == 0:
-                logger.info("Processed %d frames, last had %d detections", processed, len(dets))
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        producer.flush()
-        consumer.close()
-        logger.info("Detector stopped — processed %d frames", processed)
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is None or msg.error():
+            continue
+        try:
+            process(msg.value(), producer)
+        except Exception as e:
+            logger.error("Detector error: %s", e)
 
 
 if __name__ == "__main__":

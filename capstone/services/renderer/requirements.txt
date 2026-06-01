@@ -1,2 +1,0 @@
-confluent-kafka==2.6.1
-opencv-python-headless==4.10.0.84

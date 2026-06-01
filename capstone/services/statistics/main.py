@@ -1,145 +1,120 @@
-"""Statistics: aggregates unique car and person counts per session and globally.
-
-Exposes GET /stats on port 8002 for the web service to proxy.
-Track IDs restart at 0 for each session, so global uniqueness is tracked as
-(session_id, track_id) pairs rather than raw track IDs.
-"""
-
 import json
 import logging
 import os
-import sys
 import threading
-import time
+from dataclasses import dataclass, field
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.kafka_client import make_consumer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-CAR_TOPIC = os.environ.get("CAR_TOPIC", "tracking.cars")
-PERSON_TOPIC = os.environ.get("PERSON_TOPIC", "tracking.persons")
-SESSION_END_TOPIC = "control.session_end"
-GROUP_ID = os.environ.get("GROUP_ID", "statistics-group")
+BOOTSTRAP = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8002"))
 
-
-class SessionStats:
-    def __init__(self):
-        self.unique_cars: set[int] = set()
-        self.unique_persons: set[int] = set()
-        self.frames_cars: int = 0
-        self.frames_persons: int = 0
-        self.status: str = "processing"
-
-    def to_dict(self) -> dict:
-        return {
-            "unique_cars": len(self.unique_cars),
-            "unique_persons": len(self.unique_persons),
-            "frames_cars": self.frames_cars,
-            "frames_persons": self.frames_persons,
-            "status": self.status,
-        }
-
-
-class GlobalAggregator:
-    """Tracks uniqueness globally as (session_id, track_id) pairs."""
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._sessions: dict[str, SessionStats] = {}
-        # global sets store (session_id, track_id) tuples to avoid ID collisions across sessions
-        self._global_cars: set[tuple] = set()
-        self._global_persons: set[tuple] = set()
-
-    def update(self, msg: dict) -> None:
-        session_id = msg.get("session_id", "unknown")
-        obj_type = msg.get("object_type", "")
-        track_ids = [t["track_id"] for t in msg.get("tracks", [])]
-
-        with self._lock:
-            if session_id not in self._sessions:
-                self._sessions[session_id] = SessionStats()
-            sess = self._sessions[session_id]
-
-            if obj_type == "car":
-                sess.unique_cars.update(track_ids)
-                sess.frames_cars += 1
-                self._global_cars.update((session_id, tid) for tid in track_ids)
-            elif obj_type == "person":
-                sess.unique_persons.update(track_ids)
-                sess.frames_persons += 1
-                self._global_persons.update((session_id, tid) for tid in track_ids)
-
-    def mark_done(self, session_id: str) -> None:
-        with self._lock:
-            if session_id in self._sessions:
-                self._sessions[session_id].status = "done"
-
-    def snapshot(self) -> dict:
-        with self._lock:
-            return {
-                "sessions": {sid: s.to_dict() for sid, s in self._sessions.items()},
-                "global": {
-                    "unique_cars": len(self._global_cars),
-                    "unique_persons": len(self._global_persons),
-                },
-            }
-
-
-aggregator = GlobalAggregator()
 app = FastAPI()
+
+# Per-session stats
+@dataclass
+class SessionStats:
+    car_ids: set[int] = field(default_factory=set)
+    person_ids: set[int] = field(default_factory=set)
+    status: str = "processing"
+
+
+_lock = threading.Lock()
+sessions: dict[str, SessionStats] = {}
+# Global unique counts use (session_id, track_id) tuples — track IDs restart per session
+global_cars: set[tuple[str, int]] = set()
+global_persons: set[tuple[str, int]] = set()
+
+
+def get_session(session_id: str) -> SessionStats:
+    if session_id not in sessions:
+        sessions[session_id] = SessionStats()
+    return sessions[session_id]
+
+
+def _lower(obj):
+    """Recursively lowercase all dict keys (ksqlDB outputs UPPERCASE field names)."""
+    if isinstance(obj, dict):
+        return {k.lower(): _lower(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_lower(i) for i in obj]
+    return obj
+
+
+def handle_combined(session_id: str, payload: dict) -> None:
+    with _lock:
+        s = get_session(session_id)
+        for t in payload.get("car_tracks") or []:
+            tid = t["track_id"]
+            s.car_ids.add(tid)
+            global_cars.add((session_id, tid))
+        for t in payload.get("person_tracks") or []:
+            tid = t["track_id"]
+            s.person_ids.add(tid)
+            global_persons.add((session_id, tid))
+
+
+def handle_session_end(payload: dict) -> None:
+    session_id = payload.get("session_id", "")
+    with _lock:
+        s = get_session(session_id)
+        s.status = "done"
+    logger.info("session=%s  marked done", session_id)
+
+
+def kafka_thread() -> None:
+    consumer = make_consumer(
+        BOOTSTRAP,
+        ["tracking.combined", "control.session_end"],
+        "statistics-group",
+    )
+    logger.info("Statistics consumer started")
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is None or msg.error():
+            continue
+        try:
+            if msg.topic() == "control.session_end":
+                handle_session_end(json.loads(msg.value()))
+            else:
+                # ksqlDB uppercases all field names; session_id is in the message key
+                payload = _lower(json.loads(msg.value()))
+                session_id = msg.key().decode() if msg.key() else payload.get("session_id", "")
+                handle_combined(session_id, payload)
+        except Exception as e:
+            logger.error("Statistics error: %s", e)
 
 
 @app.get("/stats")
-def get_stats():
-    return JSONResponse(aggregator.snapshot())
-
-
-def _print_loop(interval: float = 5.0) -> None:
-    while True:
-        time.sleep(interval)
-        s = aggregator.snapshot()
-        lines = ["\n" + "=" * 50, "  GLOBAL  unique cars: {unique_cars:>5}  people: {unique_persons:>5}".format(**s["global"])]
-        for sid, ss in s["sessions"].items():
-            lines.append(f"  [{sid[:8]}] cars={ss['unique_cars']}  people={ss['unique_persons']}  status={ss['status']}")
-        lines.append("=" * 50)
-        print("\n".join(lines), flush=True)
-
-
-def _kafka_loop() -> None:
-    consumer = make_consumer(GROUP_ID, [CAR_TOPIC, PERSON_TOPIC, SESSION_END_TOPIC])
-    processed = 0
-    try:
-        while True:
-            msg = consumer.poll(timeout=1.0)
-            if msg is None:
-                continue
-            if msg.error():
-                logger.error("Consumer error: %s", msg.error())
-                continue
-
-            envelope = json.loads(msg.value())
-
-            if msg.topic() == SESSION_END_TOPIC:
-                aggregator.mark_done(envelope.get("session_id", ""))
-            else:
-                aggregator.update(envelope)
-                processed += 1
-    except Exception as exc:
-        logger.error("Kafka loop crashed: %s", exc)
-    finally:
-        consumer.close()
+def get_stats() -> JSONResponse:
+    with _lock:
+        result = {
+            "sessions": {
+                sid: {
+                    "unique_cars": len(s.car_ids),
+                    "unique_persons": len(s.person_ids),
+                    "status": s.status,
+                }
+                for sid, s in sessions.items()
+            },
+            "global": {
+                "unique_cars": len(global_cars),
+                "unique_persons": len(global_persons),
+            },
+        }
+    return JSONResponse(result)
 
 
 def main() -> None:
-    threading.Thread(target=_kafka_loop, daemon=True, name="kafka-consumer").start()
-    threading.Thread(target=_print_loop, daemon=True, name="printer").start()
-    logger.info("Statistics HTTP server on :%d", HTTP_PORT)
+    t = threading.Thread(target=kafka_thread, daemon=True)
+    t.start()
     uvicorn.run(app, host="0.0.0.0", port=HTTP_PORT, log_level="warning")
 
 

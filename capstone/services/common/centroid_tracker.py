@@ -1,104 +1,81 @@
-"""Simple centroid-based object tracker with unique ID assignment."""
-
-import math
 from collections import OrderedDict
+import numpy as np
 
 
 class CentroidTracker:
-    def __init__(self, max_disappeared: int = 30, max_distance: int = 100):
+    def __init__(self, max_disappeared: int = 30, max_distance: float = 100.0):
         self.next_id = 0
-        self.objects: OrderedDict[int, tuple[float, float]] = OrderedDict()
+        self.objects: OrderedDict[int, np.ndarray] = OrderedDict()
         self.disappeared: OrderedDict[int, int] = OrderedDict()
+        self.bboxes: dict[int, list[int]] = {}
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
 
-    def _centroid(self, bbox: list[float]) -> tuple[float, float]:
+    def _centroid(self, bbox: list[int]) -> np.ndarray:
         x1, y1, x2, y2 = bbox
-        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        return np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
 
-    def _register(self, centroid: tuple[float, float]) -> int:
-        tid = self.next_id
-        self.objects[tid] = centroid
-        self.disappeared[tid] = 0
+    def _register(self, centroid: np.ndarray, bbox: list[int]) -> None:
+        self.objects[self.next_id] = centroid
+        self.disappeared[self.next_id] = 0
+        self.bboxes[self.next_id] = bbox
         self.next_id += 1
-        return tid
 
-    def _deregister(self, tid: int) -> None:
-        del self.objects[tid]
-        del self.disappeared[tid]
+    def _deregister(self, obj_id: int) -> None:
+        del self.objects[obj_id]
+        del self.disappeared[obj_id]
+        self.bboxes.pop(obj_id, None)
 
-    def update(self, detections: list[dict]) -> dict[int, list[float]]:
-        """Update tracker with new detections; return {track_id: bbox}."""
+    def update(self, detections: list[list[int]]) -> dict[int, list[int]]:
         if not detections:
-            for tid in list(self.disappeared):
-                self.disappeared[tid] += 1
-                if self.disappeared[tid] > self.max_disappeared:
-                    self._deregister(tid)
-            return {}
+            for obj_id in list(self.disappeared):
+                self.disappeared[obj_id] += 1
+                if self.disappeared[obj_id] > self.max_disappeared:
+                    self._deregister(obj_id)
+            return dict(self.bboxes)
 
-        new_centroids = [self._centroid(d["bbox"]) for d in detections]
-        new_bboxes = [d["bbox"] for d in detections]
+        new_centroids = np.array([self._centroid(b) for b in detections])
 
         if not self.objects:
-            for cx_cy in new_centroids:
-                self._register(cx_cy)
-            return {tid: new_bboxes[i] for i, tid in enumerate(self.objects)}
+            for i, bbox in enumerate(detections):
+                self._register(new_centroids[i], bbox)
+            return dict(self.bboxes)
 
-        existing_ids = list(self.objects.keys())
-        existing_centroids = list(self.objects.values())
+        obj_ids = list(self.objects.keys())
+        obj_centroids = np.array(list(self.objects.values()))
 
-        # Pairwise distance matrix
-        dist_matrix = [
-            [
-                math.sqrt((ec[0] - nc[0]) ** 2 + (ec[1] - nc[1]) ** 2)
-                for nc in new_centroids
-            ]
-            for ec in existing_centroids
-        ]
+        # Pairwise Euclidean distances: rows=existing, cols=new
+        D = np.linalg.norm(obj_centroids[:, None] - new_centroids[None, :], axis=2)
 
-        # Greedy matching: find (row, col) of minimum distance, repeated
-        matched_rows: set[int] = set()
-        matched_cols: set[int] = set()
-        matches: list[tuple[int, int]] = []
+        # Greedy matching: sort all distances, assign closest pairs first
+        rows_sorted = D.min(axis=1).argsort()
+        cols_sorted = D.argmin(axis=1)[rows_sorted]
 
-        # Flatten and sort
-        flat = sorted(
-            [(dist_matrix[r][c], r, c) for r in range(len(existing_ids)) for c in range(len(new_centroids))],
-            key=lambda x: x[0],
-        )
-        for dist, r, c in flat:
-            if r in matched_rows or c in matched_cols:
+        used_rows: set[int] = set()
+        used_cols: set[int] = set()
+
+        for row, col in zip(rows_sorted, cols_sorted):
+            if row in used_rows or col in used_cols:
                 continue
-            if dist > self.max_distance:
-                break
-            matches.append((r, c))
-            matched_rows.add(r)
-            matched_cols.add(c)
+            if D[row, col] > self.max_distance:
+                continue
+            obj_id = obj_ids[row]
+            self.objects[obj_id] = new_centroids[col]
+            self.disappeared[obj_id] = 0
+            self.bboxes[obj_id] = detections[col]
+            used_rows.add(row)
+            used_cols.add(col)
 
-        # Update matched tracks
-        result: dict[int, list[float]] = {}
-        for r, c in matches:
-            tid = existing_ids[r]
-            self.objects[tid] = new_centroids[c]
-            self.disappeared[tid] = 0
-            result[tid] = new_bboxes[c]
+        unused_rows = set(range(len(obj_ids))) - used_rows
+        unused_cols = set(range(len(detections))) - used_cols
 
-        # Handle unmatched existing tracks
-        for r in range(len(existing_ids)):
-            if r not in matched_rows:
-                tid = existing_ids[r]
-                self.disappeared[tid] += 1
-                if self.disappeared[tid] > self.max_disappeared:
-                    self._deregister(tid)
+        for row in unused_rows:
+            obj_id = obj_ids[row]
+            self.disappeared[obj_id] += 1
+            if self.disappeared[obj_id] > self.max_disappeared:
+                self._deregister(obj_id)
 
-        # Register new detections without a match
-        for c in range(len(new_centroids)):
-            if c not in matched_cols:
-                tid = self._register(new_centroids[c])
-                result[tid] = new_bboxes[c]
+        for col in unused_cols:
+            self._register(new_centroids[col], detections[col])
 
-        return result
-
-    @property
-    def total_seen(self) -> int:
-        return self.next_id
+        return dict(self.bboxes)
