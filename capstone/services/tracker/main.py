@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import threading
 
 from common.centroid_tracker import CentroidTracker
 from common.kafka_client import make_consumer, make_producer, produce_with_backpressure
@@ -63,9 +64,20 @@ def handle_detection(payload: dict, producer) -> None:
 
 def handle_session_end(payload: dict) -> None:
     session_id = payload.get("session_id", "")
-    trackers.pop(session_id, None)
-    seen.pop(session_id, None)
-    logger.info("session=%s  cleaned up tracker", session_id)
+    total_frames = payload.get("total_frames", 0)
+    # control.session_end arrives ~8s after upload; CPU detection takes ~total_frames/5 s.
+    # Cleaning up immediately resets the seen set mid-stream → total_unique ≈ in_frame.
+    delay = max(30.0, total_frames / 5.0)
+
+    def _cleanup() -> None:
+        trackers.pop(session_id, None)
+        seen.pop(session_id, None)
+        logger.info("session=%s  cleaned up tracker", session_id)
+
+    t = threading.Timer(delay, _cleanup)
+    t.daemon = True
+    t.start()
+    logger.info("session=%s  cleanup scheduled in %.0fs", session_id, delay)
 
 
 def main() -> None:
