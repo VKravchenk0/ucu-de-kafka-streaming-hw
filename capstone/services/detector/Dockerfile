@@ -5,8 +5,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# CPU-only torch must be installed BEFORE ultralytics to avoid pulling the GPU build (~1.5 GB)
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Select the torch distribution at build time.
+#   PROCESSING_UNIT_TYPE=cpu  → CPU-only wheels  (~200 MB, default)
+#   PROCESSING_UNIT_TYPE=cuda → CUDA 12.1 wheels (~2 GB, requires NVIDIA runtime at run time)
+# torch/torchvision must NOT appear in requirements.txt — pip would resolve the GPU build without
+# the index URL and pull ~1.5 GB of extra CUDA libraries even on CPU-only hosts.
+ARG PROCESSING_UNIT_TYPE=cpu
+RUN if [ "$PROCESSING_UNIT_TYPE" = "cuda" ]; then \
+      pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu121; \
+    else \
+      pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu; \
+    fi
 
 COPY detector/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

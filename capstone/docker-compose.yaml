@@ -387,9 +387,12 @@ services:
 
   car-detector:
     profiles: [app]
+    image: capstone-car-detector:${PROCESSING_UNIT_TYPE:-cpu}
     build:
       context: ./services
       dockerfile: detector/Dockerfile
+      args:
+        PROCESSING_UNIT_TYPE: ${PROCESSING_UNIT_TYPE:-cpu}
     container_name: car-detector
     environment:
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
@@ -397,15 +400,19 @@ services:
       OUTPUT_TOPIC: detections.cars
       GROUP_ID: detector-cars
       CONF_THRESHOLD: "0.4"
+      PROCESSING_UNIT_TYPE: ${PROCESSING_UNIT_TYPE:-cpu}
     depends_on:
       - topic-init
     restart: unless-stopped
 
   person-detector:
     profiles: [app]
+    image: capstone-person-detector:${PROCESSING_UNIT_TYPE:-cpu}
     build:
       context: ./services
       dockerfile: detector/Dockerfile
+      args:
+        PROCESSING_UNIT_TYPE: ${PROCESSING_UNIT_TYPE:-cpu}
     container_name: person-detector
     environment:
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
@@ -413,6 +420,7 @@ services:
       OUTPUT_TOPIC: detections.persons
       GROUP_ID: detector-persons
       CONF_THRESHOLD: "0.4"
+      PROCESSING_UNIT_TYPE: ${PROCESSING_UNIT_TYPE:-cpu}
     depends_on:
       - topic-init
     restart: unless-stopped

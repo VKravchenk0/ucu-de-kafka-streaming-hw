@@ -144,7 +144,7 @@ stateDiagram-v2
 
 ---
 
-## Neural Network: YOLOv8n (CPU)
+## Neural Network: YOLOv8n
 
 Pre-trained COCO 80-class model, nano variant (~6 MB weights).
 
@@ -153,7 +153,51 @@ Pre-trained COCO 80-class model, nano variant (~6 MB weights).
 | 0 | person |
 | 2, 5, 7 | car, bus, truck |
 
-**Tracking:** CentroidTracker — distance-matrix greedy matching, 30-frame disappear window, no GPU required.
+**Tracking:** CentroidTracker — distance-matrix greedy matching, 30-frame disappear window.
+
+### CPU vs GPU (`PROCESSING_UNIT_TYPE`)
+
+The detector image is built for a specific compute back-end selected at **build time** via the `PROCESSING_UNIT_TYPE` build arg.  The same env var is passed at runtime to tell ultralytics which device to use.
+
+| `PROCESSING_UNIT_TYPE` | torch wheels installed | typical throughput |
+|---|---|---|
+| `cpu` (default) | CPU-only (~200 MB) | ~5 fps |
+| `cuda` | CUDA 12.1 (~2 GB) | ~80–200 fps |
+
+> **Why build-time?** CPU-only and CUDA torch are different PyPI packages resolved from different index URLs.  Swapping them at runtime would require reinstalling torch inside the container.  Building two distinct images (one per value) is the standard pattern.
+
+#### Building and running with GPU
+
+```bash
+# 1. Build the CUDA-enabled detector images
+PROCESSING_UNIT_TYPE=cuda docker compose \
+  -f docker-compose.yaml -f docker-compose.gpu.yaml \
+  --profile app build car-detector person-detector
+
+# 2. Start the full stack with GPU detectors
+PROCESSING_UNIT_TYPE=cuda docker compose \
+  -f docker-compose.yaml -f docker-compose.gpu.yaml \
+  --profile app up -d
+```
+
+`docker-compose.gpu.yaml` adds the NVIDIA device reservation (`deploy.resources.reservations.devices`) to both detector services.  The base `docker-compose.yaml` does **not** include this block, so CPU builds work without the NVIDIA Container Toolkit installed.
+
+#### WSL2 prerequisites (NVIDIA)
+
+```bash
+# On the Windows host: NVIDIA driver >= 470.76 (supports WSL2 CUDA passthrough)
+# Inside WSL2:
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
+# Verify: should print your GPU name
+docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+```
 
 ---
 
@@ -191,15 +235,36 @@ Pre-trained COCO 80-class model, nano variant (~6 MB weights).
 
 ## Quickstart
 
-### Full Docker Compose
+A `Makefile` wraps all common operations so you don't need to type long `docker compose` commands with multiple `-f` flags.
+
+### CPU (default)
 
 ```bash
 cd capstone
-docker compose --profile infra up -d
-docker compose --profile app build --no-cache     # first time: ~5–10 min (downloads torch)
-docker compose --profile app up -d
+make infra-up
+make build-cpu          # first time: ~5–10 min (downloads CPU torch ~200 MB)
+make up-cpu
 # open http://localhost:8080
 ```
+
+### GPU (NVIDIA)
+
+```bash
+cd capstone
+make infra-up
+make build-gpu          # first time: ~15–20 min (downloads CUDA torch ~2 GB)
+make up-gpu
+# open http://localhost:8080
+```
+
+Both image variants can coexist in the local image store:
+
+| Make target | Images built | torch size |
+|---|---|---|
+| `build-cpu` | `capstone-car-detector:cpu`, `capstone-person-detector:cpu` | ~200 MB |
+| `build-gpu` | `capstone-car-detector:cuda`, `capstone-person-detector:cuda` | ~2 GB |
+
+After building both, switching between runtimes is just `make up-cpu` / `make up-gpu` — no rebuild needed.
 
 ### Hybrid (infra in Docker, services run manually)
 
@@ -224,11 +289,51 @@ UPLOAD_DIR=/tmp/uploads python web/main.py
 
 ---
 
+## Verifying CPU vs GPU at runtime
+
+### 1. Startup log (fastest)
+
+The detector logs the device it will use before consuming any frames:
+
+```bash
+docker logs car-detector 2>&1 | grep "device="
+# CPU:  … Loading YOLOv8n model  class_ids=[2, 5, 7]  device=cpu
+# GPU:  … Loading YOLOv8n model  class_ids=[2, 5, 7]  device=cuda
+```
+
+### 2. torch inside the container
+
+```bash
+docker exec car-detector python -c "import torch; print(torch.cuda.is_available())"
+# False → CPU image    True → CUDA image
+```
+
+`True` means the CUDA build is installed **and** a GPU is visible to the container. `False` on a `cuda`-tagged container means the NVIDIA runtime is not set up correctly.
+
+### 3. GPU utilisation during a run (ground truth)
+
+While a video is being processed, GPU utilisation should be non-zero:
+
+```bash
+nvidia-smi
+# Watch: the python process in the car-detector / person-detector container
+# should show memory usage and > 0 % GPU-Util
+```
+
+If `nvidia-smi` shows 0 % during processing despite using `make up-gpu`, the container is falling back to CPU — check that `torch.cuda.is_available()` returns `True` inside the container (step 2).
+
+---
+
 ## Rebuild a single service
 
 ```bash
+# CPU
 docker compose --profile app build --no-cache <service-name>
 docker compose --profile app up -d --no-recreate
+
+# GPU (detectors only — they are the only GPU-aware services)
+make build-gpu
+make up-gpu
 ```
 
 ---

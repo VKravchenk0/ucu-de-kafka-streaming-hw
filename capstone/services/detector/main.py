@@ -22,13 +22,17 @@ GROUP_ID = os.environ["GROUP_ID"]           # detector-cars or detector-persons
 CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.4"))
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolov8n.pt")
 
+# "cpu" → CPU inference; "cuda" → NVIDIA GPU (image must have been built with PROCESSING_UNIT_TYPE=cuda)
+_PROCESSING_UNIT_TYPE = os.environ.get("PROCESSING_UNIT_TYPE", "cpu")
+_DEVICE = "cpu" if _PROCESSING_UNIT_TYPE == "cpu" else "cuda"
+
 COCO_NAMES = {
     0: "person", 2: "car", 5: "bus", 7: "truck",
 }
 
 
 def run_inference(frame: np.ndarray) -> list[dict]:
-    results = model.predict(frame, classes=CLASS_IDS, conf=CONF_THRESHOLD, verbose=False)
+    results = model.predict(frame, classes=CLASS_IDS, conf=CONF_THRESHOLD, device=_DEVICE, verbose=False)
     detections = []
     for r in results:
         for box in r.boxes:
@@ -64,7 +68,7 @@ def process(msg_value: bytes, producer) -> None:
 
 def main() -> None:
     global model
-    logger.info("Loading YOLOv8n model (class_ids=%s)…", CLASS_IDS)
+    logger.info("Loading YOLOv8n model  class_ids=%s  device=%s", CLASS_IDS, _DEVICE)
     model = YOLO(MODEL_PATH)
     logger.info("Model loaded. Subscribing to frames.preprocessed …")
 
