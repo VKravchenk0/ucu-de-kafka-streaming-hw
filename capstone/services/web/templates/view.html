@@ -22,6 +22,15 @@
                   align-items: center; justify-content: center; }
     video { max-width: 100%; max-height: calc(100vh - 56px); display: block; }
     canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+    .spinner-wrap { display: none; position: absolute; top: 50%; left: 50%;
+                    transform: translate(-50%, -50%); z-index: 10;
+                    flex-direction: column; align-items: center; gap: 10px; }
+    .spinner-wrap.active { display: flex; }
+    .spinner { width: 52px; height: 52px; border: 4px solid rgba(255,167,38,0.25);
+               border-top-color: #ffa726; border-radius: 50%;
+               animation: spin 0.9s linear infinite; }
+    .spinner-label { font-size: 0.85rem; color: #ffa726; font-weight: 600; }
+    @keyframes spin { to { transform: rotate(360deg); } }
     aside { width: 260px; min-width: 220px; background: #13131c; border-left: 1px solid #1e1e2e;
             padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; overflow-y: auto; }
     .stat-group { background: #1a1a24; border: 1px solid #2e2e44; border-radius: 8px; padding: 1rem; }
@@ -46,7 +55,7 @@
     <a class="back" href="/">&#8592; Upload another</a>
     <h1>Live Analytics</h1>
     <span class="sid">{{ session_id }}</span>
-    <span class="badge badge-wait" id="status-badge">Waiting…</span>
+    <span class="badge badge-buffer" id="status-badge">Buffering…</span>
     <span class="ws-status" id="ws-status">WS: connecting</span>
   </header>
 
@@ -54,6 +63,10 @@
     <div class="video-wrap" id="video-wrap">
       <video id="vid" src="/video/{{ session_id }}" controls muted playsinline></video>
       <canvas id="overlay"></canvas>
+      <div id="spinner-wrap" class="spinner-wrap active">
+        <div class="spinner"></div>
+        <span class="spinner-label">Buffering…</span>
+      </div>
     </div>
 
     <aside>
@@ -66,29 +79,36 @@
       </div>
 
       <div class="info" id="info-box">
-        Waiting for the detection pipeline… Video will start automatically once the first frames are ready.
+        Buffering… waiting for the detection pipeline to build an initial overlay buffer.
       </div>
     </aside>
   </main>
 
   <script>
     const SESSION_ID = "{{ session_id }}";
-    const vid = document.getElementById('vid');
-    const canvas = document.getElementById('overlay');
-    const ctx = canvas.getContext('2d');
+    const BUFFER_DELAY_MS = {{ buffer_delay_s }} * 1000;
 
-    // Position canvas to cover exactly the rendered video element.
-    // The video is flex-centered inside .video-wrap, so top/left are NOT 0.
+    // DOM refs — declared first to avoid TDZ errors in any callback below.
+    const vid         = document.getElementById('vid');
+    const canvas      = document.getElementById('overlay');
+    const ctx         = canvas.getContext('2d');
+    const wsStatus    = document.getElementById('ws-status');
+    const statusBadge = document.getElementById('status-badge');
+    const infoBox     = document.getElementById('info-box');
+    const spinnerWrap = document.getElementById('spinner-wrap');
+
+    function setEl(id, val) { document.getElementById(id).textContent = val; }
+
+    // -----------------------------------------------------------------------
+    // Canvas sizing
+    // -----------------------------------------------------------------------
     function syncCanvas() {
       const vr = vid.getBoundingClientRect();
       const wr = vid.parentElement.getBoundingClientRect();
-      const offsetLeft = vr.left - wr.left;
-      const offsetTop  = vr.top  - wr.top;
-      canvas.style.left   = offsetLeft + 'px';
-      canvas.style.top    = offsetTop  + 'px';
-      canvas.style.width  = vr.width   + 'px';
-      canvas.style.height = vr.height  + 'px';
-      // Internal resolution = video's natural pixel dimensions for correct bbox scaling
+      canvas.style.left   = (vr.left - wr.left) + 'px';
+      canvas.style.top    = (vr.top  - wr.top)  + 'px';
+      canvas.style.width  = vr.width  + 'px';
+      canvas.style.height = vr.height + 'px';
       canvas.width  = vid.videoWidth  || vr.width;
       canvas.height = vid.videoHeight || vr.height;
     }
@@ -97,29 +117,19 @@
     window.addEventListener('resize', syncCanvas);
 
     // -----------------------------------------------------------------------
-    // Overlay buffer: Map from video_timestamp_ms -> overlay payload
-    // Exposed on window so you can inspect from DevTools console: window.overlayBuffer.size
+    // Overlay buffer
     // -----------------------------------------------------------------------
     const overlayBuffer = new Map();
     window.overlayBuffer = overlayBuffer;
 
-    // Highest video_timestamp_ms buffered so far (-1 = nothing yet).
-    // Used to hold video playback until the pipeline is ahead of the player.
     let maxBufferedMs = -1;
-    // Set to true once the _done signal arrives; video plays freely after that.
-    let processingDone = false;
-    // ms the buffer must lead the playhead before we allow video to resume.
-    const BUFFER_LEAD_MS = 500;
 
     function addOverlay(payload) {
       overlayBuffer.set(payload.video_timestamp_ms, payload);
       if (payload.video_timestamp_ms > maxBufferedMs) {
         maxBufferedMs = payload.video_timestamp_ms;
       }
-      // Resume playback if the buffer has caught up to the current playhead.
-      if (vid.paused && !processingDone && maxBufferedMs >= vid.currentTime * 1000) {
-        vid.play().catch(() => {});
-      }
+      // No vid.play() here — only the buffer timer triggers playback.
     }
 
     function findClosestOverlay(currentMs, toleranceMs = 2000) {
@@ -131,6 +141,57 @@
       }
       return bestDiff <= toleranceMs ? best : null;
     }
+
+    // -----------------------------------------------------------------------
+    // Buffer state machine
+    // -----------------------------------------------------------------------
+    let processingDone = false;
+    let inBuffering    = false;
+    let bufferingTimer = null;
+
+    // How far (ms) the playhead may advance past maxBufferedMs before triggering a
+    // buffering stall. Covers the structural gap between the last emitted overlay
+    // and vid.duration (~100-300ms with FRAME_INTERVAL=3), preventing a spurious
+    // 30s hang at the very end of every video.
+    const OVERLAY_STALE_TOLERANCE_MS = 500;
+
+    function enterBuffering() {
+      if (inBuffering) return;
+      inBuffering = true;
+      if (!vid.paused) vid.pause();
+      spinnerWrap.classList.add('active');
+      statusBadge.textContent = 'Buffering…';
+      statusBadge.className   = 'badge badge-buffer';
+      scheduleBufferCheck();
+    }
+
+    function scheduleBufferCheck() {
+      if (bufferingTimer) clearTimeout(bufferingTimer);
+      bufferingTimer = setTimeout(() => {
+        bufferingTimer = null;
+        const currentMs = vid.currentTime * 1000;
+        if (processingDone || maxBufferedMs >= currentMs - OVERLAY_STALE_TOLERANCE_MS) {
+          exitBuffering();
+        } else {
+          // Pipeline still behind — wait another N seconds.
+          scheduleBufferCheck();
+        }
+      }, BUFFER_DELAY_MS);
+    }
+
+    function exitBuffering() {
+      if (bufferingTimer) { clearTimeout(bufferingTimer); bufferingTimer = null; }
+      inBuffering = false;
+      spinnerWrap.classList.remove('active');
+      if (!processingDone) {
+        vid.play().catch(() => {});
+        statusBadge.textContent = 'Processing';
+        statusBadge.className   = 'badge badge-live';
+      }
+    }
+
+    // Start the initial buffer wait immediately on page load.
+    enterBuffering();
 
     // -----------------------------------------------------------------------
     // Drawing
@@ -168,11 +229,13 @@
       (overlay.person_tracks || []).forEach(t => drawTrack(t, COLORS.person, 'Person'));
     }
 
+    // -----------------------------------------------------------------------
     // Animation loop
+    // -----------------------------------------------------------------------
     let _dbgTick = 0;
     function animate() {
       const currentMs = vid.currentTime * 1000;
-      const overlay = findClosestOverlay(currentMs);
+      const overlay   = findClosestOverlay(currentMs);
       drawBoxes(overlay);
 
       if (overlay) {
@@ -182,30 +245,15 @@
         setEl('persons-total', overlay.persons_total    ?? '—');
       }
 
-      // Buffer-aware pause: hold the video if the pipeline hasn't caught up yet.
-      if (!processingDone) {
-        if (maxBufferedMs < 0) {
-          // Nothing buffered yet — keep paused, show waiting state.
-          if (!vid.paused) vid.pause();
-          statusBadge.textContent = 'Buffering…';
-          statusBadge.className = 'badge badge-buffer';
-        } else if (currentMs > maxBufferedMs + BUFFER_LEAD_MS) {
-          // Video outran the buffer — pause until more overlays arrive.
-          if (!vid.paused) {
-            vid.pause();
-            statusBadge.textContent = 'Buffering…';
-            statusBadge.className = 'badge badge-buffer';
-          }
-        } else if (vid.paused) {
-          // Buffer is ahead again — this branch is normally handled by addOverlay,
-          // but catches the case where the user manually paused then seeked.
-          vid.play().catch(() => {});
+      // Enter buffering if video has outrun the overlay buffer.
+      if (!processingDone && !inBuffering) {
+        if (maxBufferedMs < 0 || currentMs > maxBufferedMs + OVERLAY_STALE_TOLERANCE_MS) {
+          enterBuffering();
         }
       }
 
-      // Log every ~3 seconds so you can verify data in the browser console
       if (++_dbgTick % 180 === 0) {
-        console.log(`[overlay] t=${currentMs.toFixed(0)}ms maxBuf=${maxBufferedMs.toFixed(0)}ms buffer=${overlayBuffer.size} overlay=${overlay ? JSON.stringify({cars:overlay.cars_in_frame, persons:overlay.persons_in_frame}) : 'null'}`);
+        console.log(`[overlay] t=${currentMs.toFixed(0)}ms maxBuf=${maxBufferedMs.toFixed(0)}ms buffer=${overlayBuffer.size} buffering=${inBuffering}`);
       }
 
       requestAnimationFrame(animate);
@@ -215,12 +263,7 @@
     // -----------------------------------------------------------------------
     // WebSocket
     // -----------------------------------------------------------------------
-    const wsStatus = document.getElementById('ws-status');
-    const statusBadge = document.getElementById('status-badge');
-    const infoBox = document.getElementById('info-box');
     let wsRetries = 0;
-
-    function setEl(id, val) { document.getElementById(id).textContent = val; }
 
     function connectWS() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -229,7 +272,6 @@
       ws.onopen = () => {
         wsStatus.textContent = 'WS: live';
         wsStatus.classList.add('connected');
-        // Keep badge-buffer or badge-wait until overlays start arriving.
         wsRetries = 0;
       };
 
@@ -237,21 +279,15 @@
         const payload = JSON.parse(e.data);
         if (payload._done) {
           processingDone = true;
+          exitBuffering();
           statusBadge.textContent = 'Done';
-          statusBadge.className = 'badge badge-done';
-          wsStatus.textContent = 'WS: done';
+          statusBadge.className   = 'badge badge-done';
+          wsStatus.textContent    = 'WS: done';
           wsStatus.classList.remove('connected');
           infoBox.textContent = `Processing complete. ${payload.total_frames} frames analysed.`;
-          // All overlays are in the buffer — let the video play freely.
-          if (vid.paused) vid.play().catch(() => {});
           return;
         }
         addOverlay(payload);
-        // Update badge to "Processing" on first overlay received.
-        if (statusBadge.className.includes('buffer') || statusBadge.className.includes('wait')) {
-          statusBadge.textContent = 'Processing';
-          statusBadge.className = 'badge badge-live';
-        }
       };
 
       ws.onclose = () => {
@@ -265,10 +301,6 @@
       ws.onerror = () => ws.close();
     }
     connectWS();
-
-    // -----------------------------------------------------------------------
-    // Global stats polling (every 3 seconds)
-    // -----------------------------------------------------------------------
   </script>
 </body>
 </html>

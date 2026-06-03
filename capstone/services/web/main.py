@@ -29,6 +29,7 @@ HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 # formula: delay = max(MIN_DONE_DELAY_S, total_frames / DETECTION_FPS_ESTIMATE)
 DETECTION_FPS_ESTIMATE: float = float(os.environ.get("DETECTION_FPS_ESTIMATE", "5"))
 MIN_DONE_DELAY_S: float = 30.0
+OVERLAY_BUFFER_DELAY_S: int = int(os.environ.get("OVERLAY_BUFFER_DELAY_S", "4"))
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -224,7 +225,11 @@ async def serve_video(session_id: str):
 
 @app.get("/view/{session_id}", response_class=HTMLResponse)
 async def view(request: Request, session_id: str):
-    return templates.TemplateResponse("view.html", {"request": request, "session_id": session_id})
+    return templates.TemplateResponse("view.html", {
+        "request": request,
+        "session_id": session_id,
+        "buffer_delay_s": OVERLAY_BUFFER_DELAY_S,
+    })
 
 
 @app.websocket("/ws/{session_id}")

@@ -483,6 +483,7 @@ services:
       STATS_URL: http://statistics:8002/stats
       UPLOAD_DIR: /uploads
       HTTP_PORT: "8080"
+      OVERLAY_BUFFER_DELAY_S: "4"
     ports:
       - "8080:8080"
     volumes:
