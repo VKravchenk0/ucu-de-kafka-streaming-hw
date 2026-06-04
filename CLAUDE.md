@@ -1,18 +1,56 @@
 # CLAUDE.md — UCU Kafka Streaming Homework
 
-## Memory Bank
+## Memory Systems
 
-This project has a persistent memory bank. **Always use it.**
+This project uses **two complementary memory stores**. Use both.
+
+---
+
+### 1. Capstone Docs Memory Bank (primary project knowledge)
+
+**Location:** `capstone/docs/memory/`
+
+Seven structured markdown files that document the project itself — read these before writing code or giving architectural advice.
+
+| File | Contains |
+|---|---|
+| `projectbrief.md` | What the project is, scope, key constraints |
+| `productContext.md` | UX goals, user scenarios, badge states |
+| `techContext.md` | Versions, env vars, Makefile commands |
+| `systemPatterns.md` | Message flow, topic design, code patterns |
+| `activeContext.md` | Current focus, recent changes, known issues |
+| `progress.md` | Feature checklist, milestone status |
+| `decisionLog.md` | Architectural decisions with rationale |
+
+#### At the start of every conversation
+
+1. Read `activeContext.md` first — it has the current focus and known issues.
+2. Read any other files relevant to the task (e.g., `systemPatterns.md` before touching the pipeline, `techContext.md` before adding dependencies).
+3. Cross-check claims against actual source files — docs can be stale.
+
+#### Update these files whenever
+
+| Trigger | File(s) to update |
+|---|---|
+| New feature completed or milestone reached | `progress.md`, `activeContext.md` |
+| Architecture changes (new service, topic, pattern) | `systemPatterns.md`, `activeContext.md` |
+| New dependency or version pin | `techContext.md` |
+| Architectural decision made | `decisionLog.md` |
+| Bug found and fixed (non-obvious root cause) | `decisionLog.md`, `activeContext.md` |
+| Work shifts focus to a different area | `activeContext.md` |
+| Known issue resolved | `progress.md`, `activeContext.md` |
+
+**Keep each file under 200 lines.** Prefer updating existing entries over appending new ones.
+
+---
+
+### 2. Auto-Memory Bank (cross-conversation personal notes)
 
 **Location:** `/home/vs/.claude/projects/-home-vs-p-ucu-de-09-data-streaming-with-kafka-ucu-de-kafka-streaming-hw/memory/`
 
-### At the start of every conversation
+Claude's personal notes — user preferences, feedback patterns, pitfalls encountered. `MEMORY.md` index is always loaded automatically in context.
 
-1. Read `MEMORY.md` (the index — always loaded automatically in context).
-2. Read any memory files whose description matches the current task before writing code or giving advice.
-3. Cross-check memory claims against current file state before asserting — memories can be stale.
-
-### Update memory whenever
+#### Update auto-memory whenever
 
 | Trigger | File to update |
 |---|---|
@@ -25,7 +63,7 @@ This project has a persistent memory bank. **Always use it.**
 | User working style or preference observed | `user_profile.md` |
 | External resource or doc location learned | create `reference_*.md` |
 
-### Memory file format
+#### Auto-memory file format
 
 ```markdown
 ---
