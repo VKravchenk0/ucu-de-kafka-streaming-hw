@@ -77,7 +77,8 @@ This prevents premature state reset (the original "cars total = cars in frame" b
 
 ```
 kafka_consumer_thread (background thread)
-    │   merge tracking.cars + tracking.persons by video_timestamp_ms
+    │   consumes tracking.combined (ksqlDB LEFT JOIN output)
+    │   _lower() normalises UPPERCASE field names
     │
     ▼
 _dispatch(session_id, overlay_dict)
@@ -93,6 +94,8 @@ _dispatch(session_id, overlay_dict)
 ```
 
 New WebSocket connections first replay `_overlay_store` (catch-up), then drain live from their subscriber queue.
+
+ksqlDB may emit two messages per frame (first with null person data, second with both). The browser `overlayBuffer.set(ts, payload)` overwrites, so only the final payload renders.
 
 ## Buffer-Aware Playback (Browser)
 
@@ -129,10 +132,21 @@ person-detector:
     GROUP_ID: detector-persons
 ```
 
-## ksqlDB Stream-Stream JOIN
+## ksqlDB Streams and State Stores
 
-ksqlDB joins `tracking.cars` and `tracking.persons` into `tracking.combined`:
-- Both streams rekeyed by `session_id + '_' + frame_number` before joining
-- LEFT JOIN within a 2-second window, 500 ms grace period
-- Output topic `tracking.combined` consumed by `statistics` service only
-- `web` service bypasses ksqlDB entirely (reads `tracking.cars` and `tracking.persons` directly) to avoid join latency
+All ksqlDB objects are created by `ksql_init` at startup.
+
+### Stream-Stream JOIN → `tracking.combined`
+- Both raw streams rekeyed by `session_id + '_' + frame_number`
+- LEFT JOIN within 2-second window, 500 ms grace period
+- Output: `tracking.combined` (consumed by **both** `web` and `statistics`)
+- Field names in the Kafka topic are UPPERCASE; consumers call `_lower()` to normalise
+
+### Aggregate Tables (state stores)
+| Table | Source | Aggregate |
+|---|---|---|
+| `session_car_stats` | `tracking_cars_raw` | `LATEST_BY_OFFSET(total_unique)` per `session_id` |
+| `session_person_stats` | `tracking_persons_raw` | `LATEST_BY_OFFSET(total_unique)` per `session_id` |
+
+- `statistics/main.py` queries these via HTTP pull query (`POST /query-stream`) on every `/stats` request
+- No Kafka consumer in statistics; the service is stateless

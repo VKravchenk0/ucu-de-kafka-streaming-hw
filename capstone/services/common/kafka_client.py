@@ -60,6 +60,15 @@ def make_consumer(
     raise RuntimeError(f"Could not connect consumer to {bootstrap_servers} after {retries} attempts")
 
 
+def _lower(obj):
+    """Recursively lowercase all dict keys (ksqlDB serialises field names in UPPERCASE)."""
+    if isinstance(obj, dict):
+        return {k.lower(): _lower(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_lower(i) for i in obj]
+    return obj
+
+
 def produce_with_backpressure(
     producer: Producer,
     topic: str,

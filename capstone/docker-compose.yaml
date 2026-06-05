@@ -464,7 +464,7 @@ services:
       dockerfile: statistics/Dockerfile
     container_name: statistics
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: broker:29092
+      KSQLDB_URL: http://ksqldb-server:8088
       HTTP_PORT: "8002"
     ports:
       - "8002:8002"

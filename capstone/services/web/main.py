@@ -14,7 +14,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi import Request
 import aiofiles
 
-from common.kafka_client import make_consumer, make_producer, produce_with_backpressure
+from common.kafka_client import _lower, make_consumer, make_producer, produce_with_backpressure
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -110,19 +110,14 @@ def _schedule_done_signal(session_id: str, total_frames: int) -> None:
 # ---------------------------------------------------------------------------
 
 def kafka_consumer_thread() -> None:
-    # Consume tracking.cars and tracking.persons directly — bypasses ksqlDB windowed
-    # join delays that caused most frames to be absent from tracking.combined.
-    # ksqlDB / tracking.combined is still consumed by the statistics service.
+    # Consume tracking.combined (ksqlDB LEFT JOIN of cars + persons) and control.session_end.
+    # ksqlDB serialises field names in UPPERCASE; _lower() normalises them before dispatch.
     consumer = make_consumer(
         BOOTSTRAP,
-        ["tracking.cars", "tracking.persons", "control.session_end"],
+        ["tracking.combined", "control.session_end"],
         "web-overlay-group",
     )
-    logger.info("Web Kafka consumer started (direct tracking topics)")
-
-    # Merge buffer: session_id → {video_timestamp_ms → combined overlay dict}
-    # Cars and persons for the same frame update the same entry; dispatch on each update.
-    merge_buf: dict[str, dict[float, dict]] = {}
+    logger.info("Web Kafka consumer started (tracking.combined)")
 
     while True:
         msg = consumer.poll(1.0)
@@ -131,46 +126,15 @@ def kafka_consumer_thread() -> None:
         try:
             topic = msg.topic()
             payload = json.loads(msg.value())
-            session_id = payload.get("session_id", "")
 
             if topic == "control.session_end":
+                session_id = payload.get("session_id", "")
                 _schedule_done_signal(session_id, payload.get("total_frames", 0))
-                merge_buf.pop(session_id, None)
                 continue
 
-            ts = payload.get("video_timestamp_ms", 0.0)
-
-            if session_id not in merge_buf:
-                merge_buf[session_id] = {}
-            if ts not in merge_buf[session_id]:
-                merge_buf[session_id][ts] = {
-                    "session_id": session_id,
-                    "video_timestamp_ms": ts,
-                    "frame_number": payload.get("frame_number", 0),
-                    "car_tracks": [],
-                    "cars_in_frame": 0,
-                    "cars_total": 0,
-                    "person_tracks": [],
-                    "persons_in_frame": 0,
-                    "persons_total": 0,
-                }
-
-            entry = merge_buf[session_id][ts]
-            if topic == "tracking.cars":
-                entry["car_tracks"] = payload.get("tracks", [])
-                entry["cars_in_frame"] = payload.get("in_frame", 0)
-                entry["cars_total"] = payload.get("total_unique", 0)
-            else:
-                entry["person_tracks"] = payload.get("tracks", [])
-                entry["persons_in_frame"] = payload.get("in_frame", 0)
-                entry["persons_total"] = payload.get("total_unique", 0)
-
-            _dispatch(session_id, dict(entry))
-
-            # Cap memory: evict oldest entries beyond 10 000 per session
-            if len(merge_buf[session_id]) > 10_000:
-                oldest = min(merge_buf[session_id])
-                del merge_buf[session_id][oldest]
+            overlay = _lower(payload)
+            session_id = msg.key().decode() if msg.key() else overlay.get("session_id", "")
+            _dispatch(session_id, overlay)
 
         except Exception as e:
             logger.error("Web consumer error: %s", e)

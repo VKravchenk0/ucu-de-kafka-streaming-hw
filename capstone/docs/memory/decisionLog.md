@@ -38,13 +38,15 @@ RUN if [ "$PROCESSING_UNIT_TYPE" = "cuda" ]; then \
 
 ---
 
-## D4 — web service reads tracking topics directly, bypassing ksqlDB
+## D4 — web service consumes `tracking.combined` (ksqlDB join)
 
-**Decision**: `web/main.py` subscribes to `tracking.cars` and `tracking.persons` directly. It does NOT consume `tracking.combined`.
+**Decision**: `web/main.py` subscribes to `tracking.combined`. The per-topic Python merge buffer (`merge_buf`) is removed.
 
-**Why**: The ksqlDB stream-stream LEFT JOIN has inherent latency (windowed join requires waiting for the window to close + grace period). Consuming `tracking.combined` in the web service caused frames to arrive significantly delayed or missing, breaking the overlay sync. Direct topic consumption gives the lowest possible latency.
+**Why original bypass was removed**: Both trackers always emit for every preprocessed frame (even with 0 detections), so the LEFT JOIN is structurally complete. Buffer-aware playback (`OVERLAY_BUFFER_DELAY_S`) absorbs join latency.
 
-**Implication**: The web merge buffer (`merge_buf` in `kafka_consumer_thread`) does its own car+person merge by `video_timestamp_ms`. The ksqlDB join is only used by the `statistics` service.
+**ksqlDB field names**: Messages have UPPERCASE keys (`CAR_TRACKS`, `VIDEO_TIMESTAMP_MS`, etc.). `_lower()` from `common/kafka_client.py` normalises them before dispatch.
+
+**Dual-emit**: ksqlDB may emit two messages per frame (immediately with null person data, again when both sides match). Browser `overlayBuffer.set(ts, payload)` overwrites, so only the final combined payload renders.
 
 ---
 
@@ -91,3 +93,17 @@ RUN if [ "$PROCESSING_UNIT_TYPE" = "cuda" ]; then \
 **Why**: A second browser tab or page reload should immediately get all overlays for a session without re-processing. The catch-up phase replays the full store. Deleting the store on `_done` would break reconnect scenarios.
 
 **Trade-off**: Memory accumulates per session. Acceptable for development/demo use; a production system would need TTL eviction.
+
+---
+
+## D10 — Statistics use ksqlDB state store (pull query), not Kafka consumer
+
+**Decision**: `statistics/main.py` no longer has a Kafka consumer thread. The `/stats` endpoint issues HTTP pull queries against two ksqlDB materialized tables: `session_car_stats` and `session_person_stats`.
+
+**Why**: Moving aggregation into ksqlDB makes the statistics service stateless (no in-memory sets). The ksqlDB tables use `LATEST_BY_OFFSET(total_unique)` per session_id, which picks the most-recent cumulative unique count already maintained by the tracker. Pull queries return current table state on demand.
+
+**Tables created in `ksql_init`**:
+- `session_car_stats` — `LATEST_BY_OFFSET(total_unique)` from `tracking_cars_raw`
+- `session_person_stats` — `LATEST_BY_OFFSET(total_unique)` from `tracking_persons_raw`
+
+**Trade-off**: `/stats` latency now depends on ksqlDB availability. If ksqlDB is down the endpoint returns 503. The old Kafka consumer approach was more resilient (in-memory cache survived ksqlDB restarts).

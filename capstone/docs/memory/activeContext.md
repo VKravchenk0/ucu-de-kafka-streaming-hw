@@ -6,6 +6,13 @@
 
 ## Recently Completed Work
 
+### ksqlDB-first streaming refactor
+- `statistics/main.py` replaced Kafka consumer + Python sets with ksqlDB pull queries
+- `ksql_init/main.py` adds `session_car_stats` and `session_person_stats` CTAS tables (`LATEST_BY_OFFSET(total_unique)`)
+- `web/main.py` now consumes `tracking.combined`; `merge_buf` removed; `_lower()` normalises UPPERCASE keys
+- `common/kafka_client.py` gains `_lower()` utility (shared by web + statistics)
+- `statistics/requirements.txt` adds `requests`; `KAFKA_BOOTSTRAP_SERVERS` env replaced by `KSQLDB_URL`
+
 ### Buffer-aware video playback (view.html)
 - Video starts paused with a spinner and "Buffering…" badge
 - Initial `OVERLAY_BUFFER_DELAY_S` (default 4 s) forced wait before first play attempt
@@ -37,7 +44,7 @@
 
 - **`_done` delay is CPU-fixed**: `DETECTION_FPS_ESTIMATE` defaults to 5 fps even when running GPU. With GPU (~80–200 fps), `max(30, total_frames/5)` still waits 30–46 s unnecessarily. Workaround: set `DETECTION_FPS_ESTIMATE` env var to a higher value when using GPU.
 
-- **`statistics/main.py` uses `tracking.combined`** (via ksqlDB). If ksqlDB is not running or the join is slow, stats will lag or be absent. The web overlay is not affected (bypasses ksqlDB).
+- **Statistics and web both depend on ksqlDB**: if ksqlDB is down, `/stats` returns 503 and web overlays will lag or be absent. Previously the web overlay bypassed ksqlDB.
 
 - **`_overlay_store` is never deleted** within a web process lifetime. Long-running servers accumulate per-session overlay lists indefinitely (memory leak for many sessions).
 

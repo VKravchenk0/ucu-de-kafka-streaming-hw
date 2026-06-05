@@ -1,109 +1,69 @@
 import json
 import logging
 import os
-import threading
-from dataclasses import dataclass, field
 
+import requests
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from common.kafka_client import make_consumer
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-BOOTSTRAP = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
+KSQLDB_URL = os.environ.get("KSQLDB_URL", "http://ksqldb-server:8088")
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8002"))
 
 app = FastAPI()
 
-# Per-session stats
-@dataclass
-class SessionStats:
-    car_ids: set[int] = field(default_factory=set)
-    person_ids: set[int] = field(default_factory=set)
-    status: str = "processing"
 
+def _pull_query(sql: str) -> list[dict]:
+    """Execute a ksqlDB pull query and return rows as dicts with lowercased keys.
 
-_lock = threading.Lock()
-sessions: dict[str, SessionStats] = {}
+    ksqlDB /query-stream returns a streaming JSONL response:
+      line 1: {"queryId": "...", "columnNames": ["COL1", ...], "columnTypes": [...]}
+      line 2+: ["val1", "val2", ...]   (one array per row)
+    """
+    url = f"{KSQLDB_URL}/query-stream"
+    headers = {"Content-Type": "application/vnd.ksqlapi.data.v1+json"}
+    resp = requests.post(url, json={"sql": sql}, headers=headers, timeout=10, stream=True)
+    resp.raise_for_status()
 
-
-def get_session(session_id: str) -> SessionStats:
-    if session_id not in sessions:
-        sessions[session_id] = SessionStats()
-    return sessions[session_id]
-
-
-def _lower(obj):
-    """Recursively lowercase all dict keys (ksqlDB outputs UPPERCASE field names)."""
-    if isinstance(obj, dict):
-        return {k.lower(): _lower(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_lower(i) for i in obj]
-    return obj
-
-
-def handle_combined(session_id: str, payload: dict) -> None:
-    with _lock:
-        s = get_session(session_id)
-        for t in payload.get("car_tracks") or []:
-            s.car_ids.add(t["track_id"])
-        for t in payload.get("person_tracks") or []:
-            s.person_ids.add(t["track_id"])
-
-
-def handle_session_end(payload: dict) -> None:
-    session_id = payload.get("session_id", "")
-    with _lock:
-        s = get_session(session_id)
-        s.status = "done"
-    logger.info("session=%s  marked done", session_id)
-
-
-def kafka_thread() -> None:
-    consumer = make_consumer(
-        BOOTSTRAP,
-        ["tracking.combined", "control.session_end"],
-        "statistics-group",
-    )
-    logger.info("Statistics consumer started")
-    while True:
-        msg = consumer.poll(1.0)
-        if msg is None or msg.error():
+    columns: list[str] = []
+    rows: list[dict] = []
+    for raw_line in resp.iter_lines():
+        if not raw_line:
             continue
-        try:
-            if msg.topic() == "control.session_end":
-                handle_session_end(json.loads(msg.value()))
-            else:
-                # ksqlDB uppercases all field names; session_id is in the message key
-                payload = _lower(json.loads(msg.value()))
-                session_id = msg.key().decode() if msg.key() else payload.get("session_id", "")
-                handle_combined(session_id, payload)
-        except Exception as e:
-            logger.error("Statistics error: %s", e)
+        data = json.loads(raw_line)
+        if isinstance(data, dict):
+            columns = [c.lower() for c in data.get("columnNames", [])]
+        elif isinstance(data, list) and columns:
+            rows.append(dict(zip(columns, data)))
+    return rows
 
 
 @app.get("/stats")
 def get_stats() -> JSONResponse:
-    with _lock:
-        result = {
-            "sessions": {
-                sid: {
-                    "unique_cars": len(s.car_ids),
-                    "unique_persons": len(s.person_ids),
-                    "status": s.status,
-                }
-                for sid, s in sessions.items()
-            },
-        }
-    return JSONResponse(result)
+    try:
+        car_rows = _pull_query("SELECT session_id, cars_total FROM session_car_stats;")
+        person_rows = _pull_query("SELECT session_id, persons_total FROM session_person_stats;")
+    except Exception as e:
+        logger.error("ksqlDB pull query failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=503)
+
+    result: dict[str, dict] = {}
+    for row in car_rows:
+        sid = row["session_id"]
+        result[sid] = {"unique_cars": row.get("cars_total") or 0, "unique_persons": 0}
+    for row in person_rows:
+        sid = row["session_id"]
+        if sid not in result:
+            result[sid] = {"unique_cars": 0, "unique_persons": 0}
+        result[sid]["unique_persons"] = row.get("persons_total") or 0
+
+    return JSONResponse({"sessions": result})
 
 
 def main() -> None:
-    t = threading.Thread(target=kafka_thread, daemon=True)
-    t.start()
     uvicorn.run(app, host="0.0.0.0", port=HTTP_PORT, log_level="warning")
 
 

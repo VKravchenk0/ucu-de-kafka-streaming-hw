@@ -61,6 +61,28 @@ FROM tracking_persons_raw
 PARTITION BY session_id + '_' + CAST(frame_number AS VARCHAR)
 EMIT CHANGES""",
 
+    # Aggregate tables — ksqlDB state stores for unique object counts per session.
+    # LATEST_BY_OFFSET(total_unique) keeps the most-recent cumulative unique count emitted by
+    # the tracker (which maintains a per-session seen-set and increments total_unique).
+    # The statistics service queries these via ksqlDB pull query instead of consuming Kafka.
+    """CREATE TABLE IF NOT EXISTS session_car_stats
+  WITH (KAFKA_TOPIC='session.car.stats', VALUE_FORMAT='JSON', PARTITIONS=3) AS
+SELECT
+  session_id,
+  LATEST_BY_OFFSET(total_unique) AS cars_total
+FROM tracking_cars_raw
+GROUP BY session_id
+EMIT CHANGES""",
+
+    """CREATE TABLE IF NOT EXISTS session_person_stats
+  WITH (KAFKA_TOPIC='session.person.stats', VALUE_FORMAT='JSON', PARTITIONS=3) AS
+SELECT
+  session_id,
+  LATEST_BY_OFFSET(total_unique) AS persons_total
+FROM tracking_persons_raw
+GROUP BY session_id
+EMIT CHANGES""",
+
     # Stream-stream LEFT JOIN within 2-second window keyed by (session_id, frame_number)
     # LEFT JOIN: always emits when car tracking arrives; persons columns are null if behind by >2s
     """CREATE STREAM IF NOT EXISTS tracking_combined
