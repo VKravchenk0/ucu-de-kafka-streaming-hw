@@ -91,3 +91,7 @@ Key facts to keep in mind:
 - GPU support uses `PROCESSING_UNIT_TYPE=cuda` build arg + `docker-compose.gpu.yaml` overlay
 - The `5` in `max(30, total_frames / DETECTION_FPS_ESTIMATE)` is CPU YOLOv8n throughput in fps — it's a named constant now, not a magic number
 - Premature `control.session_end` is the root cause of any "stats reset mid-session" or "overlays stop early" bug — both web and tracker services delay their cleanup/done signal by `total_frames / DETECTION_FPS_ESTIMATE` seconds
+
+## Formatting Rules
+
+- **Mermaid diagrams**: use `<br/>` for line breaks inside node labels — never `\n`
