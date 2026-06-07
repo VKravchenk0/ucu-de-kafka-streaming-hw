@@ -489,8 +489,10 @@ services:
     volumes:
       - uploads:/uploads
     depends_on:
-      - ksql-init
-      - generator
+      ksql-init:
+        condition: service_completed_successfully
+      generator:
+        condition: service_started
     restart: unless-stopped
 
 volumes:

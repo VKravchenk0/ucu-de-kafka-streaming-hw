@@ -1,7 +1,8 @@
 .PHONY: infra-up infra-down \
         build-cpu build-gpu \
         up-cpu up-gpu \
-        down logs
+        down logs \
+        test
 
 # ----------------------------------------------------------------------------
 # Infrastructure (Kafka, ksqlDB, Control Center, …)
@@ -46,3 +47,13 @@ down:
 
 logs:
 	docker compose --profile app logs -f
+
+# ----------------------------------------------------------------------------
+# E2E tests — starts infra+app, runs tests, tears down (set E2E_KEEP_STACK=1
+# to leave the stack running after the test for inspection)
+# ----------------------------------------------------------------------------
+
+test:
+	python3 -m venv tests/.venv
+	tests/.venv/bin/pip install -q -r tests/requirements.txt
+	tests/.venv/bin/pytest tests/ -v
