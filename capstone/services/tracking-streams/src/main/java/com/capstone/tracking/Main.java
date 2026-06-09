@@ -46,6 +46,8 @@ public class Main {
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 2);
+        props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 100);
+        props.put("producer.linger.ms", "5");
 
         StreamsBuilder builder = new StreamsBuilder();
 

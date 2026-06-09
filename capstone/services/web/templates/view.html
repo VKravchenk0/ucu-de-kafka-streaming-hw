@@ -124,22 +124,36 @@
 
     let maxBufferedMs = -1;
 
+    // True once the pipeline has delivered overlays up to (or within tolerance of)
+    // vid.duration.  At that point there is no more buffer to accumulate, so any
+    // pending stall should release regardless of RESUME_ADVANCE_MS.
+    function pipelineReachedEnd() {
+      return vid.duration > 0 && maxBufferedMs + OVERLAY_STALE_TOLERANCE_MS >= vid.duration * 1000;
+    }
+
     function addOverlay(payload) {
       overlayBuffer.set(payload.video_timestamp_ms, payload);
       if (payload.video_timestamp_ms > maxBufferedMs) {
         maxBufferedMs = payload.video_timestamp_ms;
+        // Resume as soon as the pipeline has buffered RESUME_ADVANCE_MS of video
+        // ahead of the current playhead — or the pipeline has reached the end of
+        // the video (no more overlays will arrive).
+        if (inBuffering && !processingDone &&
+            (pipelineReachedEnd() || maxBufferedMs >= vid.currentTime * 1000 + RESUME_ADVANCE_MS)) {
+          exitBuffering();
+        }
       }
-      // No vid.play() here — only the buffer timer triggers playback.
     }
 
-    function findClosestOverlay(currentMs, toleranceMs = 2000) {
-      let best = null;
-      let bestDiff = Infinity;
+    // Return the latest overlay whose timestamp is at or before currentMs.
+    // Never returns a future-frame overlay — ensures displayed boxes always
+    // correspond to a frame the video has already shown.
+    function findLatestOverlayBefore(currentMs) {
+      let best = null, bestTs = -1;
       for (const [ts, payload] of overlayBuffer) {
-        const diff = Math.abs(ts - currentMs);
-        if (diff < bestDiff) { bestDiff = diff; best = payload; }
+        if (ts <= currentMs && ts > bestTs) { bestTs = ts; best = payload; }
       }
-      return bestDiff <= toleranceMs ? best : null;
+      return best;
     }
 
     // -----------------------------------------------------------------------
@@ -149,11 +163,17 @@
     let inBuffering    = false;
     let bufferingTimer = null;
 
-    // How far (ms) the playhead may advance past maxBufferedMs before triggering a
-    // buffering stall. Covers the structural gap between the last emitted overlay
-    // and vid.duration (~100-300ms with FRAME_INTERVAL=3), preventing a spurious
-    // 30s hang at the very end of every video.
+    // Tolerance applied only in the last 2 s of the video, where there is a
+    // structural gap between the final emitted overlay and vid.duration.
     const OVERLAY_STALE_TOLERANCE_MS = 500;
+
+    // How many ms of video must be buffered AHEAD of the playhead before the
+    // video is allowed to resume after a stall.  This creates hysteresis:
+    // - Enter buffering at 0 tolerance (the moment the playhead catches up)
+    // - Exit buffering only once RESUME_ADVANCE_MS of video is ready ahead
+    // At CPU detection rate (~5 fps): stalls last ~4 s and play windows are ~4 s.
+    // At GPU rates (>video fps): the buffer stays full and no stalls occur.
+    const RESUME_ADVANCE_MS = BUFFER_DELAY_MS / 2;
 
     function enterBuffering() {
       if (inBuffering) return;
@@ -170,7 +190,7 @@
       bufferingTimer = setTimeout(() => {
         bufferingTimer = null;
         const currentMs = vid.currentTime * 1000;
-        if (processingDone || maxBufferedMs >= currentMs - OVERLAY_STALE_TOLERANCE_MS) {
+        if (processingDone || pipelineReachedEnd() || maxBufferedMs >= currentMs + RESUME_ADVANCE_MS) {
           exitBuffering();
         } else {
           // Pipeline still behind — wait another N seconds.
@@ -235,7 +255,7 @@
     let _dbgTick = 0;
     function animate() {
       const currentMs = vid.currentTime * 1000;
-      const overlay   = findClosestOverlay(currentMs);
+      const overlay   = findLatestOverlayBefore(currentMs);
       drawBoxes(overlay);
 
       if (overlay) {
@@ -245,9 +265,12 @@
         setEl('persons-total', overlay.persons_total    ?? '—');
       }
 
-      // Enter buffering if video has outrun the overlay buffer.
+      // Stall when video passes the last buffered overlay. Apply tolerance only
+      // near end-of-video to absorb the structural gap after the final overlay.
       if (!processingDone && !inBuffering) {
-        if (maxBufferedMs < 0 || currentMs > maxBufferedMs + OVERLAY_STALE_TOLERANCE_MS) {
+        const nearEnd = vid.duration && currentMs > vid.duration * 1000 - 2000;
+        const threshold = nearEnd ? OVERLAY_STALE_TOLERANCE_MS : 0;
+        if (maxBufferedMs < 0 || currentMs > maxBufferedMs + threshold) {
           enterBuffering();
         }
       }
