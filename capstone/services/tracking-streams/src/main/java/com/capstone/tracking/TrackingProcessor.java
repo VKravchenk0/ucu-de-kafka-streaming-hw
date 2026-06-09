@@ -25,21 +25,23 @@ public class TrackingProcessor extends ContextualProcessor<String, DetectionReco
     private final String storeName;
     private final int maxDisappeared;
     private final double maxDistance;
+    private final double minIou;
 
     private CentroidTracker tracker;
     private KeyValueStore<String, TrackerState> store;
 
-    public TrackingProcessor(String objectType, String storeName, int maxDisappeared, double maxDistance) {
+    public TrackingProcessor(String objectType, String storeName, int maxDisappeared, double maxDistance, double minIou) {
         this.objectType = objectType;
         this.storeName = storeName;
         this.maxDisappeared = maxDisappeared;
         this.maxDistance = maxDistance;
+        this.minIou = minIou;
     }
 
     @Override
     public void init(ProcessorContext<String, TrackingRecord> context) {
         super.init(context);
-        this.tracker = new CentroidTracker(maxDisappeared, maxDistance);
+        this.tracker = new CentroidTracker(maxDisappeared, maxDistance, minIou);
         this.store = context().getStateStore(storeName);
     }
 

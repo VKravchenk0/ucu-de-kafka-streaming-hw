@@ -35,7 +35,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class Main {
     private static final int MAX_DISAPPEARED = 30;
-    private static final double MAX_DISTANCE = 100.0;
+    private static final double MAX_DISTANCE = 200.0;
+    private static final double MIN_IOU = 0.1;
 
     public static void main(String[] args) {
         String bootstrapServers = require("KAFKA_BOOTSTRAP_SERVERS");
@@ -125,7 +126,7 @@ public class Main {
         builder.addStateStore(storeBuilder);
 
         ProcessorSupplier<String, DetectionRecord, String, TrackingRecord> processorSupplier =
-                () -> new TrackingProcessor(objectType, storeName, MAX_DISAPPEARED, MAX_DISTANCE);
+                () -> new TrackingProcessor(objectType, storeName, MAX_DISAPPEARED, MAX_DISTANCE, MIN_IOU);
 
         return builder
                 .stream(inputTopic, Consumed.with(Serdes.String(), detectionSerde))
