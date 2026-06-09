@@ -61,12 +61,6 @@ def docker_stack():
     subprocess.run([*cmd, "up", "-d"], cwd=CAPSTONE_DIR, check=True)
 
     _poll(lambda: _http_ok(f"{WEB_URL}/"), STARTUP_TIMEOUT, label="web /")
-    _poll(lambda: _http_ok(f"{KSQLDB_URL}/info"), STARTUP_TIMEOUT, label="ksqlDB /info")
-    _poll(
-        lambda: _ksql_stream_exists("TRACKING_COMBINED"),
-        STARTUP_TIMEOUT,
-        label="ksqlDB TRACKING_COMBINED stream",
-    )
 
     yield
 

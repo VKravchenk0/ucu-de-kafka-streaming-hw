@@ -110,8 +110,8 @@ def _schedule_done_signal(session_id: str, total_frames: int) -> None:
 # ---------------------------------------------------------------------------
 
 def kafka_consumer_thread() -> None:
-    # Consume tracking.combined (ksqlDB LEFT JOIN of cars + persons) and control.session_end.
-    # ksqlDB serialises field names in UPPERCASE; _lower() normalises them before dispatch.
+    # Consume tracking.combined (Kafka Streams join of cars + persons) and control.session_end.
+    # The Streams app emits lowercase keys; _lower() is a no-op on already-lowercase dicts.
     consumer = make_consumer(
         BOOTSTRAP,
         ["tracking.combined", "control.session_end"],

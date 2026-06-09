@@ -228,7 +228,6 @@ services:
       - broker
       - schema-registry
       - connect
-      - ksqldb-server
       - prometheus
       - alertmanager
     ports:
@@ -239,8 +238,6 @@ services:
       CONTROL_CENTER_BOOTSTRAP_SERVERS: 'broker:29092'
       CONTROL_CENTER_CONNECT_CONNECT-DEFAULT_CLUSTER: 'connect:8083'
       CONTROL_CENTER_CONNECT_HEALTHCHECK_ENDPOINT: '/connectors'
-      CONTROL_CENTER_KSQL_KSQLDB1_URL: "http://ksqldb-server:8088"
-      CONTROL_CENTER_KSQL_KSQLDB1_ADVERTISED_URL: "http://localhost:8088"
       CONTROL_CENTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
       CONTROL_CENTER_REPLICATION_FACTOR: 1
       CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
@@ -252,28 +249,6 @@ services:
       CONTROL_CENTER_ALERTMANAGER_URL: http://alertmanager:9093
       CONTROL_CENTER_ALERTMANAGER_CONFIG_FILE: /mnt/config/alertmanager-generated.yml
       PORT: 9021
-
-  ksqldb-server:
-    profiles: [infra]
-    image: confluentinc/cp-ksqldb-server:8.2.0
-    hostname: ksqldb-server
-    container_name: ksqldb-server
-    depends_on:
-      - broker
-      - connect
-    ports:
-      - "8088:8088"
-    environment:
-      KSQL_CONFIG_DIR: "/etc/ksql"
-      KSQL_BOOTSTRAP_SERVERS: "broker:29092"
-      KSQL_HOST_NAME: ksqldb-server
-      KSQL_LISTENERS: "http://0.0.0.0:8088"
-      KSQL_CACHE_MAX_BYTES_BUFFERING: 0
-      KSQL_KSQL_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
-      KSQL_KSQL_CONNECT_URL: "http://connect:8083"
-      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_REPLICATION_FACTOR: 1
-      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: 'true'
-      KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: 'true'
 
   rest-proxy:
     profiles: [infra]
@@ -344,17 +319,17 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
     restart: "no"
 
-  ksql-init:
+  tracking-streams:
     profiles: [app]
     build:
       context: ./services
-      dockerfile: ksql_init/Dockerfile
-    container_name: ksql-init
+      dockerfile: tracking-streams/Dockerfile
+    container_name: tracking-streams
     environment:
-      KSQLDB_URL: http://ksqldb-server:8088
+      KAFKA_BOOTSTRAP_SERVERS: broker:29092
     depends_on:
       - topic-init
-    restart: "no"
+    restart: unless-stopped
 
   generator:
     profiles: [app]
@@ -364,7 +339,7 @@ services:
     container_name: generator
     environment:
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
-      FRAME_INTERVAL: "3"
+      FRAME_INTERVAL: "1"
       JPEG_QUALITY: "85"
     volumes:
       - uploads:/uploads
@@ -425,38 +400,6 @@ services:
       - topic-init
     restart: unless-stopped
 
-  car-tracker:
-    profiles: [app]
-    build:
-      context: ./services
-      dockerfile: tracker/Dockerfile
-    container_name: car-tracker
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: broker:29092
-      OBJECT_TYPE: car
-      INPUT_TOPIC: detections.cars
-      OUTPUT_TOPIC: tracking.cars
-      GROUP_ID: tracker-car
-    depends_on:
-      - topic-init
-    restart: unless-stopped
-
-  person-tracker:
-    profiles: [app]
-    build:
-      context: ./services
-      dockerfile: tracker/Dockerfile
-    container_name: person-tracker
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: broker:29092
-      OBJECT_TYPE: person
-      INPUT_TOPIC: detections.persons
-      OUTPUT_TOPIC: tracking.persons
-      GROUP_ID: tracker-person
-    depends_on:
-      - topic-init
-    restart: unless-stopped
-
   statistics:
     profiles: [app]
     build:
@@ -464,12 +407,12 @@ services:
       dockerfile: statistics/Dockerfile
     container_name: statistics
     environment:
-      KSQLDB_URL: http://ksqldb-server:8088
+      KAFKA_BOOTSTRAP_SERVERS: broker:29092
       HTTP_PORT: "8002"
     ports:
       - "8002:8002"
     depends_on:
-      - ksql-init
+      - topic-init
     restart: unless-stopped
 
   web:
@@ -489,8 +432,8 @@ services:
     volumes:
       - uploads:/uploads
     depends_on:
-      ksql-init:
-        condition: service_completed_successfully
+      tracking-streams:
+        condition: service_started
       generator:
         condition: service_started
     restart: unless-stopped

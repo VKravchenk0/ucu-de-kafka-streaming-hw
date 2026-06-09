@@ -213,16 +213,16 @@
         const sw = (x2 - x1) * scaleX, sh = (y2 - y1) * scaleY;
 
         ctx.strokeStyle = color;
-        ctx.lineWidth = 3;
+        ctx.lineWidth = 5;
         ctx.strokeRect(sx, sy, sw, sh);
 
         const text = `${label} ${t.track_id}`;
-        ctx.font = 'bold 13px system-ui';
+        ctx.font = 'bold 15px system-ui';
         const tw = ctx.measureText(text).width;
         ctx.fillStyle = color;
-        ctx.fillRect(sx - 1, sy - 20, tw + 8, 20);
+        ctx.fillRect(sx - 1, sy - 23, tw + 8, 23);
         ctx.fillStyle = '#000';
-        ctx.fillText(text, sx + 3, sy - 5);
+        ctx.fillText(text, sx + 3, sy - 6);
       }
 
       (overlay.car_tracks    || []).forEach(t => drawTrack(t, COLORS.car,    'Car'));
