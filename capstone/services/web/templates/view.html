@@ -217,12 +217,12 @@
         ctx.strokeRect(sx, sy, sw, sh);
 
         const text = `${label} ${t.track_id}`;
-        ctx.font = 'bold 15px system-ui';
+        ctx.font = 'bold 30px system-ui';
         const tw = ctx.measureText(text).width;
         ctx.fillStyle = color;
-        ctx.fillRect(sx - 1, sy - 23, tw + 8, 23);
+        ctx.fillRect(sx - 1, sy - 48, tw + 11, 48);
         ctx.fillStyle = '#000';
-        ctx.fillText(text, sx + 3, sy - 6);
+        ctx.fillText(text, sx + 3, sy - 10);
       }
 
       (overlay.car_tracks    || []).forEach(t => drawTrack(t, COLORS.car,    'Car'));
