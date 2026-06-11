@@ -9,6 +9,7 @@ import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.JoinWindows;
 import org.apache.kafka.streams.kstream.KStream;
@@ -39,16 +40,6 @@ public class Main {
     private static final double MIN_IOU = 0.1;
 
     public static void main(String[] args) {
-        String bootstrapServers = require("KAFKA_BOOTSTRAP_SERVERS");
-
-        Properties props = new Properties();
-        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "tracking-streams");
-        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
-        props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 2);
-        props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 100);
-        props.put("producer.linger.ms", "5");
-
         StreamsBuilder builder = new StreamsBuilder();
 
         JsonSerde<DetectionRecord> detectionSerde = new JsonSerde<>(DetectionRecord.class);
@@ -63,12 +54,6 @@ public class Main {
                 builder, "detections.persons", "person", "person-tracker-state",
                 detectionSerde, trackingSerde, trackerStateSerde);
 
-        // LEFT JOIN anchored on cars: detector/main.py emits one message per preprocessed
-        // frame on *both* detection topics (even with an empty detections list), so every
-        // join key is guaranteed to exist on both sides eventually — nothing is lost. A
-        // FULL OUTER join would instead risk emitting spurious duplicate records under
-        // transient producer skew (a persons-only record, then a second "both sides" record
-        // once cars catches up within the grace period).
         KStream<String, CombinedRecord> combined = carsByFrame.leftJoin(
                 personsByFrame,
                 CombinedRecord::of,
@@ -76,36 +61,12 @@ public class Main {
                 StreamJoined.with(Serdes.String(), trackingSerde, trackingSerde)
         );
 
-        combined
-                .selectKey((frameKey, rec) -> rec.session_id)
+        combined.selectKey((frameKey, rec) -> rec.session_id)
                 .to("tracking.combined", Produced.with(Serdes.String(), combinedSerde));
 
         var topology = builder.build();
 
-        // Retry KafkaStreams construction until the broker is reachable. The admin client
-        // inside the constructor fails immediately with a DNS resolution error when the
-        // broker container hasn't started yet — unlike the Python confluent-kafka library
-        // which retries internally. Docker's restart policy would also handle this, but
-        // in-process retry avoids filling logs with repeated crash+restart cycles.
-        KafkaStreams streams = null;
-        for (int attempt = 1; ; attempt++) {
-            try {
-                streams = new KafkaStreams(topology, props);
-                break;
-            } catch (Exception e) {
-                long delaySecs = Math.min(30, attempt * 2L);
-                System.err.printf("Broker not ready (attempt %d), retrying in %ds: %s%n",
-                        attempt, delaySecs, e.getMessage());
-                try {
-                    TimeUnit.SECONDS.sleep(delaySecs);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-        }
-        Runtime.getRuntime().addShutdownHook(new Thread(streams::close));
-        streams.start();
+        startStream(topology);
     }
 
     /**
@@ -141,5 +102,41 @@ public class Main {
             throw new IllegalStateException("Missing required environment variable: " + name);
         }
         return value;
+    }
+
+    // Retry KafkaStreams construction until the broker is reachable
+    private static void startStream(Topology topology) {
+        KafkaStreams streams = null;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                streams = new KafkaStreams(topology, getProps());
+                break;
+            } catch (Exception e) {
+                long delaySecs = Math.min(30, attempt * 2L);
+                System.err.printf("Broker not ready (attempt %d), retrying in %ds: %s%n",
+                        attempt, delaySecs, e.getMessage());
+                try {
+                    TimeUnit.SECONDS.sleep(delaySecs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+        Runtime.getRuntime().addShutdownHook(new Thread(streams::close));
+        streams.start();
+    }
+
+    private static Properties getProps() {
+        String bootstrapServers = require("KAFKA_BOOTSTRAP_SERVERS");
+
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "tracking-streams");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.NUM_STREAM_THREADS_CONFIG, 2);
+        props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 100);
+        props.put("producer.linger.ms", "5");
+        return props;
     }
 }

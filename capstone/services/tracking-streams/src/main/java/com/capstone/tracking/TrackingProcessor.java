@@ -16,8 +16,7 @@ import java.util.List;
 
 /**
  * Stateful per-session centroid tracking. State (tracker internals + cumulative "seen" set)
- * is keyed by session_id in a persistent {@link KeyValueStore}, so it survives restarts and
- * needs no manual cleanup.
+ * is keyed by session_id in a persistent {@link KeyValueStore}
  */
 public class TrackingProcessor extends ContextualProcessor<String, DetectionRecord, String, TrackingRecord> {
     private final String objectType;
