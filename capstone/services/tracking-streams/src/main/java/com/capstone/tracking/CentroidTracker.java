@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Java port of {@code common/centroid_tracker.py}: two-pass cascade matching.
+ * Two-pass cascade matching for centroid-based object tracking.
  *
  * <p>Pass 1 — IoU matching: pairs existing tracks with detections whose bounding boxes
  * overlap by at least {@code minIou}. Handles cars approaching the camera (growing bbox,

@@ -90,7 +90,7 @@ Key facts to keep in mind:
 - `torch`/`torchvision` must **never** appear in `requirements.txt` — install via explicit index URL in Dockerfile
 - GPU support uses `PROCESSING_UNIT_TYPE=cuda` build arg + `docker-compose.gpu.yaml` overlay
 - The `5` in `max(30, total_frames / DETECTION_FPS_ESTIMATE)` is CPU YOLOv8n throughput in fps — it's a named constant now, not a magic number
-- Premature `control.session_end` is the root cause of any "stats reset mid-session" or "overlays stop early" bug — both web and tracker services delay their cleanup/done signal by `total_frames / DETECTION_FPS_ESTIMATE` seconds
+- Premature `control.session_end` is the root cause of any "overlays stop early" bug — `web` delays its `_done` signal by `total_frames / DETECTION_FPS_ESTIMATE` seconds
 
 ## Formatting Rules
 

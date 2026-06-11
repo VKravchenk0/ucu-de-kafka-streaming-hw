@@ -24,8 +24,8 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Single Kafka Streams app implementing the rekey/aggregate/join topology that
- * replaces the standalone Python car-tracker / person-tracker services:
+ * Single Kafka Streams app implementing the per-object-type tracking, rekey, and join
+ * topology:
  *
  * <pre>
  * detections.cars    --[track: CentroidTracker + cumulative "seen" set]--&gt; rekey by session_frame --\

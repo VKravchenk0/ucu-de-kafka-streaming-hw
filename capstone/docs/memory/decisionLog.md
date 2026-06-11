@@ -50,15 +50,15 @@ RUN if [ "$PROCESSING_UNIT_TYPE" = "cuda" ]; then \
 
 ---
 
-## D5 — Delayed `_done` signal and tracker cleanup
+## D5 — Delayed `_done` signal in web
 
-**Decision**: Both `web/main.py` and `tracker/main.py` delay their cleanup / signal dispatch using `threading.Timer` with `max(MIN_DELAY_S, total_frames / DETECTION_FPS_ESTIMATE)`.
+**Decision**: `web/main.py` delays its `_done` signal dispatch using `threading.Timer` with `max(MIN_DONE_DELAY_S, total_frames / DETECTION_FPS_ESTIMATE)`.
 
-**Why**: `control.session_end` is produced by the generator when it finishes emitting frames (~8 s after upload). But at that point, the detection pipeline still has all frames queued to process. Original code processed `session_end` immediately, which caused the tracker's `seen` sets to be wiped while detections were still arriving — producing `cars_total = cars_in_frame` (the tracking reset bug).
+**Why**: `control.session_end` is produced by the generator when it finishes emitting frames (~8 s after upload). But at that point, the detection pipeline still has all frames queued to process. Dispatching `_done` immediately would close the WebSocket before all `tracking.combined` records for the session have arrived. `tracking-streams` keeps its per-session tracker state in a persistent state store keyed by `session_id`, so cumulative counts are unaffected by `control.session_end` timing — only the web `_done` signal needs the delay.
 
 **Constants**:
 - `DETECTION_FPS_ESTIMATE = 5.0` (CPU YOLOv8n throughput in fps)
-- `MIN_DONE_DELAY_S = 30.0` (web), `MIN_CLEANUP_DELAY_S = 30.0` (tracker)
+- `MIN_DONE_DELAY_S = 30.0` (web)
 
 ---
 

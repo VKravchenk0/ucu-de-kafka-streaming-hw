@@ -15,10 +15,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 
 /**
- * Stateful per-session centroid tracking — replaces the Python {@code car-tracker}/
- * {@code person-tracker} services. State (tracker internals + cumulative "seen" set) is
- * keyed by session_id in a persistent {@link KeyValueStore}, so it survives restarts and
- * needs no manual cleanup (unlike the Python version's threading.Timer-based eviction).
+ * Stateful per-session centroid tracking. State (tracker internals + cumulative "seen" set)
+ * is keyed by session_id in a persistent {@link KeyValueStore}, so it survives restarts and
+ * needs no manual cleanup.
  */
 public class TrackingProcessor extends ContextualProcessor<String, DetectionRecord, String, TrackingRecord> {
     private final String objectType;

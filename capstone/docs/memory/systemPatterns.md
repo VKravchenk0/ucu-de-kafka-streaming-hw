@@ -58,16 +58,16 @@ All stateful services use `dict[session_id, ...]` maps (or per-key state stores)
 - `web/main.py`: `_overlay_store`, `_session_done`, `_subscribers`
 - `statistics/main.py`: `_sessions: dict[str, dict]`
 
-## Delayed Cleanup Pattern (tracker + web)
+## Delayed `_done` Signal Pattern (web)
 
-`control.session_end` arrives ~8 s after upload (generator finishes quickly), but the detection pipeline keeps running for `total_frames / DETECTION_FPS_ESTIMATE` more seconds. Both services delay state cleanup / `_done` dispatch using `threading.Timer`:
+`control.session_end` arrives ~8 s after upload (generator finishes quickly), but the detection pipeline keeps running for `total_frames / DETECTION_FPS_ESTIMATE` more seconds. `web/main.py` delays its `_done` dispatch using `threading.Timer`:
 
 ```python
-delay = max(MIN_DELAY_S, total_frames / DETECTION_FPS_ESTIMATE)
-threading.Timer(delay, cleanup_fn).start()
+delay = max(MIN_DONE_DELAY_S, total_frames / DETECTION_FPS_ESTIMATE)
+threading.Timer(delay, _send_done).start()
 ```
 
-This prevents premature state reset (the original "cars total = cars in frame" bug).
+This prevents the WebSocket from closing before all `tracking.combined` records for the session have arrived.
 
 ## Web Service: Overlay Fan-Out
 

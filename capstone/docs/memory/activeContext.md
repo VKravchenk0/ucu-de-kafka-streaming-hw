@@ -6,12 +6,11 @@
 
 ## Recently Completed Work
 
-### Kafka Streams tracking + join refactor
-- New `tracking-streams` Java/Kafka Streams app replaces the standalone `car-tracker` / `person-tracker` Python services
-- CentroidTracker (per object type, persistent state store) + a windowed LEFT JOIN (2s window, 500ms grace) produce `tracking.combined` directly from `detections.cars` / `detections.persons`
-- `web/main.py` consumes `tracking.combined`; `merge_buf` removed; `_lower()` kept as a defensive no-op normaliser
+### Kafka Streams tracking + join pipeline
+- `tracking-streams` (Java/Kafka Streams) reads `detections.cars` / `detections.persons` directly
+- CentroidTracker (per object type, persistent state store) + a windowed LEFT JOIN (2s window, 500ms grace) produce `tracking.combined`
+- `web/main.py` consumes `tracking.combined`; `_lower()` kept as a defensive no-op normaliser
 - `statistics/main.py` consumes `tracking.combined` via a Kafka consumer thread and keeps an in-memory per-session map of `cars_total` / `persons_total`
-- `tracking.cars`, `tracking.persons` topics removed; `tracking-streams` reads `detections.*` directly
 
 ### Buffer-aware video playback (view.html)
 - Video starts paused with a spinner and "Buffering…" badge
@@ -25,11 +24,6 @@
 - `docker-compose.gpu.yaml` overlay adds NVIDIA device reservation to both detectors
 - Separate image tags: `capstone-car-detector:cpu` / `capstone-car-detector:cuda`
 - `make build-gpu` / `make up-gpu` in Makefile
-
-### Session tracking fix
-- Premature `control.session_end` was wiping `seen` sets mid-stream in tracker
-- Fixed with `threading.Timer(max(30, total_frames/5), cleanup_fn)` in `tracker/main.py`
-- Same delay pattern applied to `_done` dispatch in `web/main.py`
 
 ### Removed global counters
 - `statistics/main.py` previously maintained `global_cars`, `global_persons` sets
@@ -52,7 +46,7 @@
 |---|---|
 | `services/web/templates/view.html` | UI/UX changes, overlay rendering, buffer logic |
 | `services/web/main.py` | WebSocket lifecycle, `_done` timing, new routes |
-| `services/tracker/main.py` | Tracking logic, session cleanup timing |
+| `services/tracking-streams/src/main/java/com/capstone/tracking/` | Tracking and join logic |
 | `docker-compose.yaml` | Env var tuning (FRAME_INTERVAL, OVERLAY_BUFFER_DELAY_S) |
 
 ## How to Test After Changes
