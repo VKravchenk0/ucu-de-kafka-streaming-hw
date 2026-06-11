@@ -38,12 +38,8 @@ flowchart LR
         FP["frames.preprocessed"]
         DC["detections.cars"]
         DP["detections.persons"]
-        TC["tracking.cars"]
-        TP["tracking.persons"]
         SE["control.session_end"]
-        TCO["tracking.combined\n(ksqlDB stream join)"]
-        SCS["session.car.stats\n(ksqlDB table)"]
-        SPS["session.person.stats\n(ksqlDB table)"]
+        TCO["tracking.combined\n(Kafka Streams join)"]
     end
 
     subgraph Pipeline
@@ -51,9 +47,7 @@ flowchart LR
         PRE["preprocessor"]
         CAR["car-detector\nYOLOv8n cls=2,5,7"]
         PER["person-detector\nYOLOv8n cls=0"]
-        CT["car-tracker\nCentroidTracker"]
-        PT["person-tracker\nCentroidTracker"]
-        KSQL["ksqlDB :8088\nstream join + aggregate tables"]
+        TS["tracking-streams\nCentroidTracker + windowed join"]
         STAT[":8002 statistics"]
     end
 
@@ -67,18 +61,12 @@ flowchart LR
     FP --> PER
     CAR --> DC
     PER --> DP
-    DC --> CT
-    DP --> PT
-    CT --> TC
-    PT --> TP
-    TC --> KSQL
-    TP --> KSQL
-    KSQL --> TCO
-    KSQL --> SCS
-    KSQL --> SPS
+    DC --> TS
+    DP --> TS
+    TS --> TCO
     TCO --> OVG
     SE --> OVG
-    STAT -->|HTTP pull query| KSQL
+    TCO --> STAT
     STAT -->|GET /stats| Web
 ```
 
@@ -88,16 +76,13 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    participant CT as car-tracker / person-tracker
-    participant KS as ksqlDB (persistent query)
+    participant TS as tracking-streams (Kafka Streams)
     participant K as Kafka (tracking.combined)
     participant W as Web service
     participant B as Browser
 
-    CT->>K: tracking.cars / tracking.persons (per frame, UPPERCASE keys)
-    KS->>K: LEFT JOIN within 2s window, produces tracking.combined (UPPERCASE keys)
+    TS->>K: CentroidTracker per object type, windowed LEFT JOIN -> tracking.combined
     K->>W: kafka_consumer_thread polls tracking.combined
-    W->>W: _lower() normalises UPPERCASE keys
     W->>W: _dispatch to _overlay_store[session_id]
     W->>W: fan-out to _subscribers[session_id]
     W->>B: WebSocket sends overlay JSON
@@ -107,8 +92,6 @@ sequenceDiagram
 ```
 
 Sync is by **`video_timestamp_ms`** (milliseconds from start of video file, set by OpenCV `cap.get(CAP_PROP_POS_MSEC)`). The browser searches for the buffered overlay whose timestamp is closest to `video.currentTime * 1000`, within a 2-second tolerance.
-
-ksqlDB serialises all JSON field names in **UPPERCASE**. The `_lower()` utility in `common/kafka_client.py` recursively lowercases all dict keys before dispatch so the browser receives standard lowercase field names.
 
 Because the detection pipeline runs faster than playback speed, all overlays for the whole video arrive at the browser before the video finishes playing. The browser stores them all in `overlayBuffer` (a `Map<ms, payload>`) and looks up the right one each animation frame.
 
@@ -139,32 +122,25 @@ stateDiagram-v2
 | Container | Port | Role |
 |---|---|---|
 | `topic-init` | — | One-shot: creates Kafka topics; exits 0 |
-| `ksql-init` | — | One-shot: creates ksqlDB streams, LEFT JOIN, and aggregate tables; exits 0 |
 | `generator` | — | Reads uploaded video frame-by-frame → `frames.raw`; emits `control.session_end` |
 | `preprocessor` | — | Resizes frames to 640×640 → `frames.preprocessed` |
 | `car-detector` | — | YOLOv8n class IDs 2,5,7 → `detections.cars` (shared image with person-detector) |
 | `person-detector` | — | YOLOv8n class ID 0 → `detections.persons` |
-| `car-tracker` | — | CentroidTracker → `tracking.cars` (shared image with person-tracker) |
-| `person-tracker` | — | CentroidTracker → `tracking.persons` |
-| `statistics` | 8002 | FastAPI `GET /stats`; pulls counts from ksqlDB aggregate tables via HTTP |
+| `tracking-streams` | — | Kafka Streams app: CentroidTracker per object type, then a windowed LEFT JOIN → `tracking.combined` |
+| `statistics` | 8002 | FastAPI `GET /stats`; per-session unique counts from `tracking.combined` |
 | `web` | 8080 | Upload, video serve, WebSocket overlay stream (from `tracking.combined`), UI |
-| ksqlDB (infra) | 8088 | Joins `tracking.cars` + `tracking.persons` → `tracking.combined`; maintains `session_car_stats` / `session_person_stats` aggregate tables |
 
 ---
 
-## ksqlDB Objects
+## Kafka Streams Topology (`tracking-streams`)
 
-| Object | Type | Kafka topic | Description |
-|---|---|---|---|
-| `tracking_cars_raw` | Stream | `tracking.cars` | Source stream for car tracking messages |
-| `tracking_persons_raw` | Stream | `tracking.persons` | Source stream for person tracking messages |
-| `tracking_cars_rekeyed` | Stream | `tracking.cars.rekeyed` | Rekeyed by `session_id + '_' + frame_number` for join |
-| `tracking_persons_rekeyed` | Stream | `tracking.persons.rekeyed` | Rekeyed by `session_id + '_' + frame_number` for join |
-| `tracking_combined` | Stream | `tracking.combined` | LEFT JOIN within 2s window / 0.5s grace; consumed by web |
-| `session_car_stats` | Table | `session.car.stats` | `LATEST_BY_OFFSET(total_unique)` per session; state store for statistics |
-| `session_person_stats` | Table | `session.person.stats` | `LATEST_BY_OFFSET(total_unique)` per session; state store for statistics |
-
-The statistics service queries `session_car_stats` and `session_person_stats` via ksqlDB pull queries (`POST /query-stream`) — no Kafka consumer in statistics.
+| Step | Description |
+|---|---|
+| Source | `detections.cars` and `detections.persons` |
+| Tracking | `CentroidTracker` per object type (greedy centroid matching, 30-frame disappear window), tracked via a persistent state store; produces per-frame `in_frame` and cumulative `total_unique` counts |
+| Rekey | Each tracked stream is rekeyed by `session_id + "_" + frame_number` |
+| Join | LEFT JOIN (cars anchored) within a 2-second window / 500ms grace period |
+| Sink | Rekeyed by `session_id`, written to `tracking.combined` |
 
 ---
 
@@ -233,13 +209,9 @@ docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
 | `frames.preprocessed` | 3 | 5 MB | session_id | preprocessor |
 | `detections.cars` | 3 | 256 KB | session_id | car-detector |
 | `detections.persons` | 3 | 256 KB | session_id | person-detector |
-| `tracking.cars` | 3 | 256 KB | session_id | car-tracker |
-| `tracking.persons` | 3 | 256 KB | session_id | person-tracker |
 | `control.upload` | 1 | 4 KB | session_id | web |
 | `control.session_end` | 1 | 4 KB | session_id | generator |
-| `tracking.combined` | 3 | — | session_id | ksqlDB (stream join) |
-| `session.car.stats` | 3 | — | session_id | ksqlDB (aggregate table) |
-| `session.person.stats` | 3 | — | session_id | ksqlDB (aggregate table) |
+| `tracking.combined` | 3 | 256 KB | session_id | tracking-streams (Kafka Streams join) |
 
 `session_id` (UUID) as Kafka key → `hash(session_id) % 3` routes all messages for one session to the same partition, preserving per-session ordering without coordination.
 
@@ -249,7 +221,7 @@ docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
 
 `GET http://localhost:8002/stats` (also proxied at `GET http://localhost:8080/stats`)
 
-The statistics service issues ksqlDB pull queries against the `session_car_stats` and `session_person_stats` materialized tables to read the latest cumulative unique counts per session.
+The statistics service consumes `tracking.combined` and keeps an in-memory per-session map of the latest cumulative `cars_total` / `persons_total` unique counts.
 
 ```json
 {
@@ -304,15 +276,16 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install ultralytics
 export KAFKA_BOOTSTRAP_SERVERS=localhost:9092 PYTHONPATH=.
 python topic_init/main.py
-KSQLDB_URL=http://localhost:8088 python ksql_init/main.py
 python generator/main.py &
 python preprocessor/main.py &
 CLASS_IDS=2,5,7 OUTPUT_TOPIC=detections.cars  GROUP_ID=detector-cars    python detector/main.py &
 CLASS_IDS=0     OUTPUT_TOPIC=detections.persons GROUP_ID=detector-persons python detector/main.py &
-OBJECT_TYPE=car    INPUT_TOPIC=detections.cars    OUTPUT_TOPIC=tracking.cars    GROUP_ID=tracker-car    python tracker/main.py &
-OBJECT_TYPE=person INPUT_TOPIC=detections.persons OUTPUT_TOPIC=tracking.persons GROUP_ID=tracker-person python tracker/main.py &
-KSQLDB_URL=http://localhost:8088 python statistics/main.py &
+python statistics/main.py &
 UPLOAD_DIR=/tmp/uploads python web/main.py
+
+# tracking-streams is a Java/Kafka Streams app — run it via Docker:
+cd ..
+docker compose --profile app up -d tracking-streams
 ```
 
 ---
@@ -372,17 +345,7 @@ make up-gpu
 # All Kafka topics created
 docker exec broker kafka-topics --bootstrap-server broker:29092 --list
 
-# ksqlDB streams and tables
-curl -s http://localhost:8088/ksql \
-  -H 'Content-Type: application/vnd.ksql.v1+json' \
-  -d '{"ksql":"LIST STREAMS;"}' | python3 -m json.tool
-
-curl -s http://localhost:8088/ksql \
-  -H 'Content-Type: application/vnd.ksql.v1+json' \
-  -d '{"ksql":"SHOW TABLES;"}' | python3 -m json.tool
-# Should list: SESSION_CAR_STATS, SESSION_PERSON_STATS
-
-# Statistics (backed by ksqlDB pull queries)
+# Statistics
 curl -s http://localhost:8002/stats | python3 -m json.tool
 
 # Consumer group lag
@@ -401,15 +364,13 @@ capstone/
 ├── README.md
 └── services/
     ├── common/
-    │   ├── kafka_client.py      # make_producer, make_consumer, produce_with_backpressure, _lower
-    │   └── centroid_tracker.py  # CentroidTracker
+    │   └── kafka_client.py      # make_producer, make_consumer, produce_with_backpressure, _lower
     ├── topic_init/              # Dockerfile  main.py  requirements.txt
-    ├── ksql_init/               # Dockerfile  main.py  requirements.txt  (7 ksqlDB objects)
     ├── generator/               # Dockerfile  main.py  requirements.txt
     ├── preprocessor/            # Dockerfile  main.py  requirements.txt
     ├── detector/                # shared image: car-detector + person-detector
-    ├── tracker/                 # shared image: car-tracker + person-tracker
-    ├── statistics/              # Dockerfile  main.py  requirements.txt  (ksqlDB pull queries)
+    ├── tracking-streams/        # Java/Kafka Streams app: CentroidTracker + windowed join -> tracking.combined
+    ├── statistics/              # Dockerfile  main.py  requirements.txt
     └── web/
         ├── Dockerfile
         ├── main.py

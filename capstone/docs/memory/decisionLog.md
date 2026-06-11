@@ -38,15 +38,15 @@ RUN if [ "$PROCESSING_UNIT_TYPE" = "cuda" ]; then \
 
 ---
 
-## D4 — web service consumes `tracking.combined` (ksqlDB join)
+## D4 — web service consumes `tracking.combined` (Kafka Streams join)
 
 **Decision**: `web/main.py` subscribes to `tracking.combined`. The per-topic Python merge buffer (`merge_buf`) is removed.
 
-**Why original bypass was removed**: Both trackers always emit for every preprocessed frame (even with 0 detections), so the LEFT JOIN is structurally complete. Buffer-aware playback (`OVERLAY_BUFFER_DELAY_S`) absorbs join latency.
+**Why original bypass was removed**: The `tracking-streams` app always emits for every preprocessed frame (even with 0 detections), so the LEFT JOIN is structurally complete. Buffer-aware playback (`OVERLAY_BUFFER_DELAY_S`) absorbs join latency.
 
-**ksqlDB field names**: Messages have UPPERCASE keys (`CAR_TRACKS`, `VIDEO_TIMESTAMP_MS`, etc.). `_lower()` from `common/kafka_client.py` normalises them before dispatch.
+**Field names**: `tracking.combined` messages already use lowercase keys (`car_tracks`, `video_timestamp_ms`, etc.). `_lower()` from `common/kafka_client.py` is kept as a defensive no-op normaliser before dispatch.
 
-**Dual-emit**: ksqlDB may emit two messages per frame (immediately with null person data, again when both sides match). Browser `overlayBuffer.set(ts, payload)` overwrites, so only the final combined payload renders.
+**Dual-emit**: the windowed join may emit two messages per frame (immediately with null person data, again when both sides match within the window). Browser `overlayBuffer.set(ts, payload)` overwrites, so only the final combined payload renders.
 
 ---
 
@@ -96,14 +96,10 @@ RUN if [ "$PROCESSING_UNIT_TYPE" = "cuda" ]; then \
 
 ---
 
-## D10 — Statistics use ksqlDB state store (pull query), not Kafka consumer
+## D10 — Statistics consume `tracking.combined` directly (in-memory per-session map)
 
-**Decision**: `statistics/main.py` no longer has a Kafka consumer thread. The `/stats` endpoint issues HTTP pull queries against two ksqlDB materialized tables: `session_car_stats` and `session_person_stats`.
+**Decision**: `statistics/main.py` runs a Kafka consumer thread on `tracking.combined`. The `/stats` endpoint reads an in-memory `dict[session_id, {"unique_cars": int, "unique_persons": int}]`.
 
-**Why**: Moving aggregation into ksqlDB makes the statistics service stateless (no in-memory sets). The ksqlDB tables use `LATEST_BY_OFFSET(total_unique)` per session_id, which picks the most-recent cumulative unique count already maintained by the tracker. Pull queries return current table state on demand.
+**Why**: `tracking-streams` already maintains the cumulative `cars_total` / `persons_total` unique counts per session inside its own state stores and emits the latest values on every `tracking.combined` record (`LATEST_BY_OFFSET`-style semantics via the CentroidTracker's running count). Statistics just needs to track the latest value per session, which an in-memory map does cheaply and keeps the service stateless to restart (rebuilds from the topic on next message).
 
-**Tables created in `ksql_init`**:
-- `session_car_stats` — `LATEST_BY_OFFSET(total_unique)` from `tracking_cars_raw`
-- `session_person_stats` — `LATEST_BY_OFFSET(total_unique)` from `tracking_persons_raw`
-
-**Trade-off**: `/stats` latency now depends on ksqlDB availability. If ksqlDB is down the endpoint returns 503. The old Kafka consumer approach was more resilient (in-memory cache survived ksqlDB restarts).
+**Note**: a LEFT JOIN means `persons_total` can be `None` on a record where the persons side hasn't arrived within the join window yet — the consumer keeps the previous non-null value in that case.

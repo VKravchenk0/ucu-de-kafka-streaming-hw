@@ -10,7 +10,6 @@ import requests
 CAPSTONE_DIR = Path(__file__).resolve().parent.parent
 
 WEB_URL = os.environ.get("WEB_URL", "http://localhost:8080")
-KSQLDB_URL = os.environ.get("KSQLDB_URL", "http://localhost:8088")
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "300"))
 E2E_TIMEOUT = int(os.environ.get("E2E_TIMEOUT", "60"))
@@ -26,22 +25,6 @@ TEST_VIDEO = (
 def _http_ok(url: str) -> bool:
     try:
         return requests.get(url, timeout=3).status_code == 200
-    except Exception:
-        return False
-
-
-def _ksql_stream_exists(stream_name: str) -> bool:
-    try:
-        r = requests.post(
-            f"{KSQLDB_URL}/ksql",
-            json={"ksql": "LIST STREAMS;"},
-            timeout=5,
-        )
-        if r.status_code != 200:
-            return False
-        streams = r.json()
-        names = [s.get("name", "") for s in streams[0].get("streams", [])]
-        return stream_name.upper() in [n.upper() for n in names]
     except Exception:
         return False
 

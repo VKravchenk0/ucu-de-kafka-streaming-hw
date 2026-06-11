@@ -24,8 +24,8 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Replaces the ksqlDB rekey/aggregate/join topology and the Python car-tracker /
- * person-tracker services with a single Kafka Streams app:
+ * Single Kafka Streams app implementing the rekey/aggregate/join topology that
+ * replaces the standalone Python car-tracker / person-tracker services:
  *
  * <pre>
  * detections.cars    --[track: CentroidTracker + cumulative "seen" set]--&gt; rekey by session_frame --\
@@ -110,9 +110,8 @@ public class Main {
 
     /**
      * Source -&gt; stateful centroid tracking (cumulative unique count) -&gt; rekey by
-     * {@code session_id + "_" + frame_number}, mirroring ksqlDB's
-     * {@code PARTITION BY session_id + '_' + frame_number} rekeyed streams so the two
-     * object-type streams can be exact-matched per frame in the windowed join.
+     * {@code session_id + "_" + frame_number} so the two object-type streams can be
+     * exact-matched per frame in the windowed join.
      */
     private static KStream<String, TrackingRecord> trackedStream(
             StreamsBuilder builder,

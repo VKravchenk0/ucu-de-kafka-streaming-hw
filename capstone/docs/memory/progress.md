@@ -8,11 +8,9 @@
 - [x] JPEG encoding, base64 framing, Kafka fan-out
 - [x] Preprocessor resizes frames to 640×640
 - [x] YOLOv8n inference (CPU default, GPU optional)
-- [x] CentroidTracker per session (greedy centroid matching, 30-frame disappear window)
-- [x] `tracking.cars` and `tracking.persons` topics populated correctly
-- [x] ksqlDB LEFT JOIN producing `tracking.combined` (consumed by both web and statistics)
-- [x] ksqlDB aggregate tables: `session_car_stats`, `session_person_stats` (state stores)
-- [x] Per-session statistics via `GET /stats` (ksqlDB pull query, stateless)
+- [x] CentroidTracker per session (greedy centroid matching, 30-frame disappear window), implemented in the `tracking-streams` Kafka Streams app
+- [x] Kafka Streams windowed LEFT JOIN producing `tracking.combined` (consumed by both web and statistics)
+- [x] Per-session statistics via `GET /stats` (in-memory, fed by `tracking.combined`)
 
 ### Web / Browser
 - [x] WebSocket overlay streaming with catch-up replay on reconnect
@@ -42,7 +40,6 @@
 
 - [ ] `DETECTION_FPS_ESTIMATE` is hard-coded to CPU speed (5 fps) — `_done` delay is unnecessarily long when running GPU; no env var override documented at runtime
 - [ ] `_overlay_store` memory leak for long-running servers with many sessions — no TTL or eviction policy
-- [ ] Statistics and web both depend on ksqlDB; if ksqlDB is unavailable, `/stats` returns 503 and overlays won't arrive
 - [ ] No authentication or session isolation — anyone can view any session ID
 - [ ] `findClosestOverlay` is O(n) per animation frame — could be slow with very long videos
 
@@ -57,4 +54,4 @@
 | Frame skipping for performance | Complete |
 | README + Makefile for easy startup | Complete |
 | Memory bank docs | Complete |
-| ksqlDB streaming refactor (state stores + unified consumer) | Complete |
+| Kafka Streams tracking + join refactor | Complete |

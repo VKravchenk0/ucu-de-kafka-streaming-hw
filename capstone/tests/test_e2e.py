@@ -50,8 +50,8 @@ def test_records_in_kafka(session_id):
         f"within {E2E_TIMEOUT}s"
     )
     first = records[0]
-    # SESSION_ID is the Kafka message key (PARTITION BY c.session_id in ksqlDB);
-    # FRAME_NUMBER is always present in the value.
+    # session_id is the Kafka message key (set via selectKey in the Streams topology);
+    # frame_number is always present in the value.
     assert "FRAME_NUMBER" in first or "frame_number" in first, (
         f"Unexpected record shape: {first}"
     )

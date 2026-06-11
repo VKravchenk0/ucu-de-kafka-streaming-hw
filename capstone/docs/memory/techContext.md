@@ -16,7 +16,6 @@
 | httpx | 0.27.2 |
 | aiofiles | 24.1.0 |
 | python-multipart | 0.0.17 |
-| requests | 2.32.3 (ksql_init only) |
 
 ## Infrastructure (docker-compose.yaml, profile: infra)
 
@@ -25,7 +24,6 @@
 | broker | confluentinc/cp-kafka:7.5.0 | 3-broker KRaft Kafka cluster |
 | schema-registry | confluentinc/cp-schema-registry:7.5.0 | Schema registry |
 | connect | confluentinc/cp-kafka-connect:7.5.0 | Kafka Connect |
-| ksqldb-server | confluentinc/cp-ksqldb-server:7.5.0 | ksqlDB (port 8088) |
 | control-center | confluentinc/cp-enterprise-control-center:7.5.0 | Kafka UI (port 9021) |
 | rest-proxy | confluentinc/cp-kafka-rest:7.5.0 | REST proxy |
 | prometheus | prom/prometheus:v2.54.1 | Metrics scraping |
@@ -36,13 +34,11 @@
 | Container | Build | Port |
 |---|---|---|
 | topic-init | services/ | — |
-| ksql-init | services/ | — |
 | generator | services/ | — |
 | preprocessor | services/ | — |
 | car-detector | services/ (PROCESSING_UNIT_TYPE arg) | — |
 | person-detector | services/ (PROCESSING_UNIT_TYPE arg) | — |
-| car-tracker | services/ | — |
-| person-tracker | services/ | — |
+| tracking-streams | services/ (Java / Kafka Streams) | — |
 | statistics | services/ | 8002 |
 | web | services/ | 8080 |
 
@@ -90,7 +86,7 @@ PROCESSING_UNIT_TYPE=cuda docker compose \
 | CLASS_IDS | (required) | detector (2,5,7 or 0) |
 | CONF_THRESHOLD | 0.4 | detector |
 | PROCESSING_UNIT_TYPE | cpu | detector (build + runtime) |
-| DETECTION_FPS_ESTIMATE | 5 | tracker, web |
+| DETECTION_FPS_ESTIMATE | 5 | web |
 | OVERLAY_BUFFER_DELAY_S | 4 | web |
 | HTTP_PORT | 8080 / 8002 | web, statistics |
 | UPLOAD_DIR | /uploads | web |

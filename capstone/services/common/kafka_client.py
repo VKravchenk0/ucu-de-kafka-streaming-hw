@@ -61,7 +61,7 @@ def make_consumer(
 
 
 def _lower(obj):
-    """Recursively lowercase all dict keys (ksqlDB serialises field names in UPPERCASE)."""
+    """Recursively lowercase all dict keys."""
     if isinstance(obj, dict):
         return {k.lower(): _lower(v) for k, v in obj.items()}
     if isinstance(obj, list):

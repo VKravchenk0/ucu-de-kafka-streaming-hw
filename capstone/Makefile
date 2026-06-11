@@ -5,7 +5,7 @@
         test
 
 # ----------------------------------------------------------------------------
-# Infrastructure (Kafka, ksqlDB, Control Center, …)
+# Infrastructure (Kafka, Control Center, …)
 # ----------------------------------------------------------------------------
 
 infra-up:

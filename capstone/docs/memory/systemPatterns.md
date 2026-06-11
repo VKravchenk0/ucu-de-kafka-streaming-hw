@@ -16,27 +16,25 @@ web ──► control.upload
           │                                          │                │
           ├──────────────────────────────────►  detections.cars  detections.persons
           │                                          │                │
-          │                                          ▼                ▼
-          │                                    car-tracker     person-tracker
-          │                                          │                │
-          │                                          ▼                ▼
-          │                                    tracking.cars   tracking.persons
-          │                                          │                │
-          │                                          ├────────────────┤
-          │                                          ▼                │
-          │                                    ksqlDB JOIN            │
-          │                                    (tracking.combined)    │
-          │                                          │                │
-          │                                          ▼                │
-          │                                      statistics           │
-          │                                                           │
-          └──────────────────── web ◄────────────────────────────────┘
-                                 │
-                                 ▼
-                           WebSocket
-                                 │
-                                 ▼
-                              Browser canvas
+          │                                          └───────┬────────┘
+          │                                                   ▼
+          │                                          tracking-streams
+          │                                       (CentroidTracker x2 +
+          │                                        windowed LEFT JOIN)
+          │                                                   │
+          │                                                   ▼
+          │                                          tracking.combined
+          │                                                   │
+          │                                          ┌────────┴────────┐
+          │                                          ▼                 ▼
+          │                                     statistics            web
+          │                                                            │
+          └──────────────────────────────────────────────────────────►│
+                                                                        ▼
+                                                                  WebSocket
+                                                                        │
+                                                                        ▼
+                                                                 Browser canvas
 ```
 
 ## Kafka Topic Design
@@ -49,18 +47,16 @@ web ──► control.upload
 | frames.preprocessed | 3 | session_id | 5 MB max |
 | detections.cars | 3 | session_id | 256 KB max |
 | detections.persons | 3 | session_id | 256 KB max |
-| tracking.cars | 3 | session_id | 256 KB max |
-| tracking.persons | 3 | session_id | 256 KB max |
-| tracking.combined | 3 | session_id | ksqlDB-managed |
+| tracking.combined | 3 | session_id | 256 KB max, written by tracking-streams |
 
 `hash(session_id) % 3` routes all messages for one session to the same partition — preserving per-session ordering without a coordinator.
 
 ## Per-Session State Pattern
 
-All stateful services use `dict[session_id, ...]` maps rather than global counters:
-- `tracker/main.py`: `trackers: dict[str, CentroidTracker]`, `seen: dict[str, set[int]]`
+All stateful services use `dict[session_id, ...]` maps (or per-key state stores) rather than global counters:
+- `tracking-streams`: per-object-type Kafka Streams state stores (`car-tracker-state`, `person-tracker-state`) keyed by `session_id`, holding `CentroidTracker` state and the cumulative `total_unique` count
 - `web/main.py`: `_overlay_store`, `_session_done`, `_subscribers`
-- `statistics/main.py`: `sessions: dict[str, SessionStats]`
+- `statistics/main.py`: `_sessions: dict[str, dict]`
 
 ## Delayed Cleanup Pattern (tracker + web)
 
@@ -77,8 +73,8 @@ This prevents premature state reset (the original "cars total = cars in frame" b
 
 ```
 kafka_consumer_thread (background thread)
-    │   consumes tracking.combined (ksqlDB LEFT JOIN output)
-    │   _lower() normalises UPPERCASE field names
+    │   consumes tracking.combined (Kafka Streams LEFT JOIN output)
+    │   _lower() normalises field names (defensive no-op)
     │
     ▼
 _dispatch(session_id, overlay_dict)
@@ -95,7 +91,7 @@ _dispatch(session_id, overlay_dict)
 
 New WebSocket connections first replay `_overlay_store` (catch-up), then drain live from their subscriber queue.
 
-ksqlDB may emit two messages per frame (first with null person data, second with both). The browser `overlayBuffer.set(ts, payload)` overwrites, so only the final payload renders.
+The windowed join may emit two messages per frame (first with null person data, second with both). The browser `overlayBuffer.set(ts, payload)` overwrites, so only the final payload renders.
 
 ## Buffer-Aware Playback (Browser)
 
@@ -113,7 +109,7 @@ exitBuffering(): hide spinner + vid.play()
 
 `OVERLAY_STALE_TOLERANCE_MS = 500` prevents spurious end-of-video stalls caused by the structural gap between the last emitted overlay and `vid.duration`.
 
-## Shared Image Pattern (detector, tracker)
+## Shared Image Pattern (detector)
 
 Car and person variants share one Docker image with different runtime env vars:
 ```yaml
@@ -132,21 +128,15 @@ person-detector:
     GROUP_ID: detector-persons
 ```
 
-## ksqlDB Streams and State Stores
+## Kafka Streams Topology (`tracking-streams`)
 
-All ksqlDB objects are created by `ksql_init` at startup.
+Implemented in `services/tracking-streams` (Java, `Main.java` / `TrackingProcessor.java`).
 
-### Stream-Stream JOIN → `tracking.combined`
-- Both raw streams rekeyed by `session_id + '_' + frame_number`
-- LEFT JOIN within 2-second window, 500 ms grace period
-- Output: `tracking.combined` (consumed by **both** `web` and `statistics`)
-- Field names in the Kafka topic are UPPERCASE; consumers call `_lower()` to normalise
+### Per-object-type tracking → rekey
+- `detections.cars` and `detections.persons` are each processed by a `CentroidTracker` (greedy centroid matching, 30-frame disappear window) backed by a persistent state store (`car-tracker-state` / `person-tracker-state`)
+- Each tracked stream is rekeyed by `session_id + "_" + frame_number`
 
-### Aggregate Tables (state stores)
-| Table | Source | Aggregate |
-|---|---|---|
-| `session_car_stats` | `tracking_cars_raw` | `LATEST_BY_OFFSET(total_unique)` per `session_id` |
-| `session_person_stats` | `tracking_persons_raw` | `LATEST_BY_OFFSET(total_unique)` per `session_id` |
-
-- `statistics/main.py` queries these via HTTP pull query (`POST /query-stream`) on every `/stats` request
-- No Kafka consumer in statistics; the service is stateless
+### Windowed Stream-Stream JOIN → `tracking.combined`
+- LEFT JOIN (cars anchored) within a 2-second window, 500 ms grace period
+- Output rekeyed by `session_id`, written to `tracking.combined` (consumed by **both** `web` and `statistics`)
+- Field names in the Kafka topic are already lowercase (`car_tracks`, `video_timestamp_ms`, `cars_total`, `persons_total`, etc.)

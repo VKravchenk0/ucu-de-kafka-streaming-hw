@@ -6,12 +6,12 @@
 
 ## Recently Completed Work
 
-### ksqlDB-first streaming refactor
-- `statistics/main.py` replaced Kafka consumer + Python sets with ksqlDB pull queries
-- `ksql_init/main.py` adds `session_car_stats` and `session_person_stats` CTAS tables (`LATEST_BY_OFFSET(total_unique)`)
-- `web/main.py` now consumes `tracking.combined`; `merge_buf` removed; `_lower()` normalises UPPERCASE keys
-- `common/kafka_client.py` gains `_lower()` utility (shared by web + statistics)
-- `statistics/requirements.txt` adds `requests`; `KAFKA_BOOTSTRAP_SERVERS` env replaced by `KSQLDB_URL`
+### Kafka Streams tracking + join refactor
+- New `tracking-streams` Java/Kafka Streams app replaces the standalone `car-tracker` / `person-tracker` Python services
+- CentroidTracker (per object type, persistent state store) + a windowed LEFT JOIN (2s window, 500ms grace) produce `tracking.combined` directly from `detections.cars` / `detections.persons`
+- `web/main.py` consumes `tracking.combined`; `merge_buf` removed; `_lower()` kept as a defensive no-op normaliser
+- `statistics/main.py` consumes `tracking.combined` via a Kafka consumer thread and keeps an in-memory per-session map of `cars_total` / `persons_total`
+- `tracking.cars`, `tracking.persons` topics removed; `tracking-streams` reads `detections.*` directly
 
 ### Buffer-aware video playback (view.html)
 - Video starts paused with a spinner and "Buffering…" badge
@@ -43,8 +43,6 @@
 ## Current Known Issues / Watch Points
 
 - **`_done` delay is CPU-fixed**: `DETECTION_FPS_ESTIMATE` defaults to 5 fps even when running GPU. With GPU (~80–200 fps), `max(30, total_frames/5)` still waits 30–46 s unnecessarily. Workaround: set `DETECTION_FPS_ESTIMATE` env var to a higher value when using GPU.
-
-- **Statistics and web both depend on ksqlDB**: if ksqlDB is down, `/stats` returns 503 and web overlays will lag or be absent. Previously the web overlay bypassed ksqlDB.
 
 - **`_overlay_store` is never deleted** within a web process lifetime. Long-running servers accumulate per-session overlay lists indefinitely (memory leak for many sessions).
 
