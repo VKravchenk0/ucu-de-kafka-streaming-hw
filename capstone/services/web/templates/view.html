@@ -10,7 +10,6 @@
            min-height: 100vh; display: flex; flex-direction: column; }
     header { padding: 1rem 1.5rem; border-bottom: 1px solid #1e1e2e;
              display: flex; align-items: center; gap: 1rem; }
-    header h1 { font-size: 1.1rem; color: #fff; }
     header .sid { font-size: 0.75rem; color: #555; font-family: monospace; }
     .badge { padding: 0.2rem 0.6rem; border-radius: 99px; font-size: 0.75rem; font-weight: 600; }
     .badge-live   { background: #1a3d1a; color: #4caf50; }
@@ -45,18 +44,13 @@
     .info { font-size: 0.78rem; color: #555; line-height: 1.5; }
     a.back { font-size: 0.85rem; color: #6c63ff; text-decoration: none; }
     a.back:hover { text-decoration: underline; }
-    .ws-status { font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 4px;
-                 background: #1a1a2a; color: #666; }
-    .ws-status.connected { color: #4caf50; background: #0f2a0f; }
   </style>
 </head>
 <body>
   <header>
-    <a class="back" href="/">&#8592; Upload another</a>
-    <h1>Live Analytics</h1>
+    <a class="back" href="/">&#8592; Upload</a>
     <span class="sid">{{ session_id }}</span>
     <span class="badge badge-buffer" id="status-badge">Buffering…</span>
-    <span class="ws-status" id="ws-status">WS: connecting</span>
   </header>
 
   <main>
@@ -71,16 +65,14 @@
 
     <aside>
       <div class="stat-group">
-        <h3>This Session</h3>
+        <h3>Session Stats</h3>
         <div class="stat-row"><span class="label">Cars in frame</span><span class="value car" id="cars-frame">—</span></div>
         <div class="stat-row"><span class="label">Cars total</span><span class="value car" id="cars-total">—</span></div>
         <div class="stat-row"><span class="label">People in frame</span><span class="value person" id="persons-frame">—</span></div>
         <div class="stat-row"><span class="label">People total</span><span class="value person" id="persons-total">—</span></div>
       </div>
 
-      <div class="info" id="info-box">
-        Buffering… waiting for the detection pipeline to build an initial overlay buffer.
-      </div>
+      <div class="info" id="info-box"></div>
     </aside>
   </main>
 
@@ -92,7 +84,6 @@
     const vid         = document.getElementById('vid');
     const canvas      = document.getElementById('overlay');
     const ctx         = canvas.getContext('2d');
-    const wsStatus    = document.getElementById('ws-status');
     const statusBadge = document.getElementById('status-badge');
     const infoBox     = document.getElementById('info-box');
     const spinnerWrap = document.getElementById('spinner-wrap');
@@ -293,8 +284,6 @@
       const ws = new WebSocket(`${proto}://${location.host}/ws/${SESSION_ID}`);
 
       ws.onopen = () => {
-        wsStatus.textContent = 'WS: live';
-        wsStatus.classList.add('connected');
         wsRetries = 0;
       };
 
@@ -305,8 +294,6 @@
           exitBuffering();
           statusBadge.textContent = 'Done';
           statusBadge.className   = 'badge badge-done';
-          wsStatus.textContent    = 'WS: done';
-          wsStatus.classList.remove('connected');
           infoBox.textContent = `Processing complete. ${payload.total_frames} frames analysed.`;
           return;
         }
@@ -314,8 +301,6 @@
       };
 
       ws.onclose = () => {
-        wsStatus.textContent = 'WS: closed';
-        wsStatus.classList.remove('connected');
         if (wsRetries < 5) {
           wsRetries++;
           setTimeout(connectWS, 2000 * wsRetries);
