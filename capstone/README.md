@@ -1,27 +1,41 @@
-# Capstone: E2E Video Analytics Pipeline
+# Capstone: E2E Video Stream Processing Pipeline
 
-Kafka-based pipeline that detects and tracks cars and people in an uploaded video. The
-browser starts playing the video almost immediately and overlays live bounding boxes and
-running counts while detection is still catching up in the background.
+Kafka-based pipeline that detects and tracks cars and people in an uploaded video. The browser starts playing the video almost immediately and overlays live bounding boxes and running counts while detection is still catching up in the background.
 
 ---
 
-## Quickstart
+## 1. Quickstart
+
+**Prerequisites:**
+- Docker + Docker Compose
+- (Optional, for better performance) NVIDIA GPU with driver ≥ 470.76 and the NVIDIA Container Toolkit configured for Docker
+  (see `docker-compose.gpu.yaml` for the WSL2 setup steps)
+- No GPU? Use the commented CPU commands below instead
 
 ```bash
 cd capstone
-make infra-up     # Kafka cluster, schema registry, control center
-make build-cpu    # first run only — pulls CPU torch (~200 MB), ~5-10 min
-make up-cpu
+
+# Run Kafka cluster, schema registry, control center
+make infra-up
+
+# first run only — pulls CUDA torch (~2 GB), ~15-20 min
+make build-gpu
+
+# CPU-only alternative — pulls CPU torch (~200 MB), ~5-10 min
+# make build-cpu
+
+make up-gpu
+# CPU-only alternative
+# make up-cpu
 ```
 
 Open http://localhost:8080 and upload a video.
 
 ---
 
-## Architecture
+## 2. Architecture
 
-### Overview
+### 2.1 Overview
 
 Every upload gets a `session_id` (UUID) that's used as the Kafka message key for every
 message in the pipeline, so multiple uploads run side by side without interfering with
@@ -36,7 +50,7 @@ The browser plays the **original** uploaded file directly over HTTP and draws bo
 boxes on a `<canvas>` overlay, fed by a WebSocket and synced to the video's own
 timestamp — no transcoded or annotated video ever goes through Kafka.
 
-### Diagram
+### 2.2 Diagram
 
 ```mermaid
 flowchart LR
@@ -69,10 +83,11 @@ flowchart LR
     DP --> TS
     TS --> TC --> WEB
     TC --> STAT
+    WEB -->|GET /stats proxy| STAT
     WEB -->|WebSocket overlays| Browser
 ```
 
-### Services
+### 2.3 Services
 
 | Container | Port | Role |
 |---|---|---|
@@ -83,12 +98,12 @@ flowchart LR
 | `person-detector` | — | YOLOv8n, class 0 (person) → `detections.persons` |
 | `tracking-streams` | — | Kafka Streams app: per-object tracking + windowed join → `tracking.combined` |
 | `statistics` | 8002 | FastAPI, per-session unique car/person counts |
-| `web` | 8080 | Upload UI, video serving, WebSocket overlay stream |
+| `web` | 8080 | Upload UI, video serving, WebSocket overlay stream, proxies `/stats` |
 
 `car-detector` and `person-detector` share one image, differentiated by `CLASS_IDS`,
 `OUTPUT_TOPIC` and `GROUP_ID`.
 
-### Topics
+### 2.4 Topics
 
 | Topic | Partitions | Max msg | Producer |
 |---|---|---|---|
@@ -103,7 +118,7 @@ flowchart LR
 `session_id` is the key on every topic, so `hash(session_id) % partitions` keeps a
 session's messages on one partition without any extra coordination.
 
-### Tracking: IoU + centroid
+### 2.5 Tracking: Intersection over Union (IoU) + centroid
 
 `tracking-streams` runs one `CentroidTracker` per object type (car, person), with each
 session's state kept in a Kafka Streams state store. For every detection frame it does a
@@ -121,10 +136,10 @@ Tracks unmatched for `MAX_DISAPPEARED = 30` frames are dropped; detections unmat
 either pass become new tracks. Each tracker also keeps a cumulative set of every track ID
 it has ever seen, which becomes the `*_total` (unique object) count per session.
 
-### Kafka Streams
+### 2.6 Kafka Streams
 
-`tracking-streams` (`services/tracking-streams`, Java) is a single Kafka Streams app that
-replaced an earlier ksqlDB-based join. Its topology:
+`tracking-streams` (`services/tracking-streams`, Java) is a single Kafka Streams app. Its
+topology:
 
 1. Consume `detections.cars` / `detections.persons`, run the tracker above via a custom
    `Processor` backed by a persistent state store keyed by `session_id`.
@@ -141,18 +156,13 @@ and `statistics` only ever need to read `tracking.combined`.
 
 ---
 
-## Build
+## 3. Build
 
-CPU (default, no GPU needed):
-
-```bash
-make build-cpu
-```
-
-GPU (NVIDIA, CUDA 12.1 torch):
+GPU (default — NVIDIA, CUDA 12.1 torch):
 
 ```bash
 make build-gpu
+# make build-cpu  # CPU-only alternative, no GPU needed
 ```
 
 Both produce separate image tags (`capstone-car-detector:cpu` / `:cuda`, same for
@@ -169,11 +179,12 @@ docker compose --profile app up -d --no-recreate
 
 ---
 
-## Run
+## 4. Run
 
 ```bash
 make infra-up   # Kafka cluster + schema registry + control center (once)
-make up-cpu     # or: make up-gpu
+make up-gpu
+# make up-cpu   # CPU-only alternative
 ```
 
 Open http://localhost:8080, upload a video, and watch it play with overlays. Stats are at
@@ -193,9 +204,13 @@ Useful env vars (set in `docker-compose.yaml`):
 | `DETECTION_FPS_ESTIMATE` | `5` | Expected detector throughput; controls how long `web` waits before ending a session |
 | `OVERLAY_BUFFER_DELAY_S` | `4` | Initial/re-buffer wait in the browser player |
 
+> Running GPU: bump `DETECTION_FPS_ESTIMATE` (e.g. to `80`) — the default `5` assumes CPU
+> throughput, so `web` will otherwise wait longer than necessary before marking a session
+> done.
+
 ---
 
-## Tests
+## 5. Tests
 
 ```bash
 make test
