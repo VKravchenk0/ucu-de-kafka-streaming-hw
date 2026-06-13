@@ -1,381 +1,207 @@
 # Capstone: E2E Video Analytics Pipeline
 
-Real-time car and person detection/tracking pipeline built on Apache Kafka. Upload a video in the browser, watch it play with bounding box overlays, and see live statistics — before the full video has been processed.
-
----
-
-## Architecture
-
-```mermaid
-flowchart LR
-    subgraph Browser
-        direction TB
-        VID["&lt;video&gt; plays /video/{sid}"]
-        CVS["&lt;canvas&gt; overlay\n(requestAnimationFrame)"]
-        WS["WebSocket /ws/{sid}"]
-        VID -.sync by timestamp.-> CVS
-        WS -->|overlay JSON| CVS
-    end
-
-    subgraph Web[":8080 web"]
-        direction TB
-        UP["POST /upload"]
-        STORE["_overlay_store\n(durable per-session list)"]
-        SUBS["_subscribers\n(fan-out queues)"]
-        WE["websocket_endpoint\ncatch-up + live stream"]
-        OVG["kafka_consumer_thread\nweb-overlay-group\ntracking.combined"]
-        UP -->|produce| CU
-        OVG -->|_dispatch| STORE
-        OVG -->|_dispatch| SUBS
-        SUBS --> WE
-        STORE -->|catch-up replay| WE
-        WE <--> WS
-    end
-
-    subgraph Kafka
-        CU["control.upload"]
-        FR["frames.raw"]
-        FP["frames.preprocessed"]
-        DC["detections.cars"]
-        DP["detections.persons"]
-        SE["control.session_end"]
-        TCO["tracking.combined\n(Kafka Streams join)"]
-    end
-
-    subgraph Pipeline
-        GEN["generator"]
-        PRE["preprocessor"]
-        CAR["car-detector\nYOLOv8n cls=2,5,7"]
-        PER["person-detector\nYOLOv8n cls=0"]
-        TS["tracking-streams\nCentroidTracker + windowed join"]
-        STAT[":8002 statistics"]
-    end
-
-    Browser -->|upload| UP
-    CU --> GEN
-    GEN --> FR
-    GEN --> SE
-    FR --> PRE
-    PRE --> FP
-    FP --> CAR
-    FP --> PER
-    CAR --> DC
-    PER --> DP
-    DC --> TS
-    DP --> TS
-    TS --> TCO
-    TCO --> OVG
-    SE --> OVG
-    TCO --> STAT
-    STAT -->|GET /stats| Web
-```
-
----
-
-## Overlay synchronization detail
-
-```mermaid
-sequenceDiagram
-    participant TS as tracking-streams (Kafka Streams)
-    participant K as Kafka (tracking.combined)
-    participant W as Web service
-    participant B as Browser
-
-    TS->>K: CentroidTracker per object type, windowed LEFT JOIN -> tracking.combined
-    K->>W: kafka_consumer_thread polls tracking.combined
-    W->>W: _dispatch to _overlay_store[session_id]
-    W->>W: fan-out to _subscribers[session_id]
-    W->>B: WebSocket sends overlay JSON
-    B->>B: overlayBuffer.set(video_timestamp_ms, payload)
-    B->>B: requestAnimationFrame findClosestOverlay
-    B->>B: drawBoxes on canvas
-```
-
-Sync is by **`video_timestamp_ms`** (milliseconds from start of video file, set by OpenCV `cap.get(CAP_PROP_POS_MSEC)`). The browser searches for the buffered overlay whose timestamp is closest to `video.currentTime * 1000`, within a 2-second tolerance.
-
-Because the detection pipeline runs faster than playback speed, all overlays for the whole video arrive at the browser before the video finishes playing. The browser stores them all in `overlayBuffer` (a `Map<ms, payload>`) and looks up the right one each animation frame.
-
----
-
-## WebSocket connection lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> Connecting: browser opens /ws/{sid}
-    Connecting --> CatchUp: websocket accepted\nregister subscriber queue
-    CatchUp --> LiveStream: replay _overlay_store (all frames so far)
-    LiveStream --> LiveStream: new overlay arrives via Kafka
-    LiveStream --> Done: _done received (session_end)
-    Done --> [*]: WS closes, subscriber queue removed\n_overlay_store KEPT
-    LiveStream --> Closed: disconnect or 300s timeout
-    Closed --> [*]: subscriber queue removed\n_overlay_store KEPT
-
-    note right of CatchUp: Second user or page reload\ngets instant full replay
-```
-
-`_overlay_store` is never deleted (within a web process lifetime). A second user or page reload immediately replays all stored overlays, then continues live.
-
----
-
-## Services
-
-| Container | Port | Role |
-|---|---|---|
-| `topic-init` | — | One-shot: creates Kafka topics; exits 0 |
-| `generator` | — | Reads uploaded video frame-by-frame → `frames.raw`; emits `control.session_end` |
-| `preprocessor` | — | Resizes frames to 640×640 → `frames.preprocessed` |
-| `car-detector` | — | YOLOv8n class IDs 2,5,7 → `detections.cars` (shared image with person-detector) |
-| `person-detector` | — | YOLOv8n class ID 0 → `detections.persons` |
-| `tracking-streams` | — | Kafka Streams app: CentroidTracker per object type, then a windowed LEFT JOIN → `tracking.combined` |
-| `statistics` | 8002 | FastAPI `GET /stats`; per-session unique counts from `tracking.combined` |
-| `web` | 8080 | Upload, video serve, WebSocket overlay stream (from `tracking.combined`), UI |
-
----
-
-## Kafka Streams Topology (`tracking-streams`)
-
-| Step | Description |
-|---|---|
-| Source | `detections.cars` and `detections.persons` |
-| Tracking | `CentroidTracker` per object type (greedy centroid matching, 30-frame disappear window), tracked via a persistent state store; produces per-frame `in_frame` and cumulative `total_unique` counts |
-| Rekey | Each tracked stream is rekeyed by `session_id + "_" + frame_number` |
-| Join | LEFT JOIN (cars anchored) within a 2-second window / 500ms grace period |
-| Sink | Rekeyed by `session_id`, written to `tracking.combined` |
-
----
-
-## Neural Network: YOLOv8n
-
-Pre-trained COCO 80-class model, nano variant (~6 MB weights).
-
-| Class IDs | Objects |
-|---|---|
-| 0 | person |
-| 2, 5, 7 | car, bus, truck |
-
-**Tracking:** CentroidTracker — distance-matrix greedy matching, 30-frame disappear window.
-
-### CPU vs GPU (`PROCESSING_UNIT_TYPE`)
-
-The detector image is built for a specific compute back-end selected at **build time** via the `PROCESSING_UNIT_TYPE` build arg.  The same env var is passed at runtime to tell ultralytics which device to use.
-
-| `PROCESSING_UNIT_TYPE` | torch wheels installed | typical throughput |
-|---|---|---|
-| `cpu` (default) | CPU-only (~200 MB) | ~5 fps |
-| `cuda` | CUDA 12.1 (~2 GB) | ~80–200 fps |
-
-> **Why build-time?** CPU-only and CUDA torch are different PyPI packages resolved from different index URLs.  Swapping them at runtime would require reinstalling torch inside the container.  Building two distinct images (one per value) is the standard pattern.
-
-#### Building and running with GPU
-
-```bash
-# 1. Build the CUDA-enabled detector images
-PROCESSING_UNIT_TYPE=cuda docker compose \
-  -f docker-compose.yaml -f docker-compose.gpu.yaml \
-  --profile app build car-detector person-detector
-
-# 2. Start the full stack with GPU detectors
-PROCESSING_UNIT_TYPE=cuda docker compose \
-  -f docker-compose.yaml -f docker-compose.gpu.yaml \
-  --profile app up -d
-```
-
-`docker-compose.gpu.yaml` adds the NVIDIA device reservation (`deploy.resources.reservations.devices`) to both detector services.  The base `docker-compose.yaml` does **not** include this block, so CPU builds work without the NVIDIA Container Toolkit installed.
-
-#### WSL2 prerequisites (NVIDIA)
-
-```bash
-# On the Windows host: NVIDIA driver >= 470.76 (supports WSL2 CUDA passthrough)
-# Inside WSL2:
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-
-# Verify: should print your GPU name
-docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
-```
-
----
-
-## Kafka Topics
-
-| Topic | Partitions | Max message | Key | Producer |
-|---|---|---|---|---|
-| `frames.raw` | 3 | 5 MB | session_id | generator |
-| `frames.preprocessed` | 3 | 5 MB | session_id | preprocessor |
-| `detections.cars` | 3 | 256 KB | session_id | car-detector |
-| `detections.persons` | 3 | 256 KB | session_id | person-detector |
-| `control.upload` | 1 | 4 KB | session_id | web |
-| `control.session_end` | 1 | 4 KB | session_id | generator |
-| `tracking.combined` | 3 | 256 KB | session_id | tracking-streams (Kafka Streams join) |
-
-`session_id` (UUID) as Kafka key → `hash(session_id) % 3` routes all messages for one session to the same partition, preserving per-session ordering without coordination.
-
----
-
-## Statistics API
-
-`GET http://localhost:8002/stats` (also proxied at `GET http://localhost:8080/stats`)
-
-The statistics service consumes `tracking.combined` and keeps an in-memory per-session map of the latest cumulative `cars_total` / `persons_total` unique counts.
-
-```json
-{
-  "sessions": {
-    "aaa-bbb": {"unique_cars": 5, "unique_persons": 12}
-  }
-}
-```
+Kafka-based pipeline that detects and tracks cars and people in an uploaded video. The
+browser starts playing the video almost immediately and overlays live bounding boxes and
+running counts while detection is still catching up in the background.
 
 ---
 
 ## Quickstart
 
-A `Makefile` wraps all common operations so you don't need to type long `docker compose` commands with multiple `-f` flags.
-
-### CPU (default)
-
 ```bash
 cd capstone
-make infra-up
-make build-cpu          # first time: ~5–10 min (downloads CPU torch ~200 MB)
+make infra-up     # Kafka cluster, schema registry, control center
+make build-cpu    # first run only — pulls CPU torch (~200 MB), ~5-10 min
 make up-cpu
-# open http://localhost:8080
 ```
 
-### GPU (NVIDIA)
+Open http://localhost:8080 and upload a video.
 
-```bash
-cd capstone
-make infra-up
-make build-gpu          # first time: ~15–20 min (downloads CUDA torch ~2 GB)
-make up-gpu
-# open http://localhost:8080
+---
+
+## Architecture
+
+### Overview
+
+Every upload gets a `session_id` (UUID) that's used as the Kafka message key for every
+message in the pipeline, so multiple uploads run side by side without interfering with
+each other. The video flows through:
+
+```
+upload -> generator -> preprocessor -> {car,person}-detector (YOLOv8n)
+       -> tracking-streams (tracking + join) -> web (overlays) / statistics (counts)
 ```
 
-Both image variants can coexist in the local image store:
+The browser plays the **original** uploaded file directly over HTTP and draws bounding
+boxes on a `<canvas>` overlay, fed by a WebSocket and synced to the video's own
+timestamp — no transcoded or annotated video ever goes through Kafka.
 
-| Make target | Images built | torch size |
+### Diagram
+
+```mermaid
+flowchart LR
+    Browser["Browser<br/>video player + canvas overlay"]
+
+    WEB["web :8080"]
+    GEN[generator]
+    PRE[preprocessor]
+    CAR["car-detector<br/>YOLOv8n cls 2,5,7"]
+    PER["person-detector<br/>YOLOv8n cls 0"]
+    TS["tracking-streams<br/>CentroidTracker + windowed join"]
+    STAT["statistics :8002"]
+
+    subgraph Kafka
+        CU[control.upload]
+        FR[frames.raw]
+        FP[frames.preprocessed]
+        DC[detections.cars]
+        DP[detections.persons]
+        TC[tracking.combined]
+        SE[control.session_end]
+    end
+
+    Browser -->|POST /upload| WEB --> CU --> GEN
+    GEN --> FR --> PRE --> FP
+    FP --> CAR --> DC
+    FP --> PER --> DP
+    GEN --> SE --> WEB
+    DC --> TS
+    DP --> TS
+    TS --> TC --> WEB
+    TC --> STAT
+    WEB -->|WebSocket overlays| Browser
+```
+
+### Services
+
+| Container | Port | Role |
 |---|---|---|
-| `build-cpu` | `capstone-car-detector:cpu`, `capstone-person-detector:cpu` | ~200 MB |
-| `build-gpu` | `capstone-car-detector:cuda`, `capstone-person-detector:cuda` | ~2 GB |
+| `topic-init` | — | One-shot: creates Kafka topics, exits 0 |
+| `generator` | — | Reads the uploaded file frame-by-frame → `frames.raw`; emits `control.session_end` when done |
+| `preprocessor` | — | Resizes frames to 640×640 → `frames.preprocessed` |
+| `car-detector` | — | YOLOv8n, classes 2/5/7 (car/bus/truck) → `detections.cars` |
+| `person-detector` | — | YOLOv8n, class 0 (person) → `detections.persons` |
+| `tracking-streams` | — | Kafka Streams app: per-object tracking + windowed join → `tracking.combined` |
+| `statistics` | 8002 | FastAPI, per-session unique car/person counts |
+| `web` | 8080 | Upload UI, video serving, WebSocket overlay stream |
 
-After building both, switching between runtimes is just `make up-cpu` / `make up-gpu` — no rebuild needed.
+`car-detector` and `person-detector` share one image, differentiated by `CLASS_IDS`,
+`OUTPUT_TOPIC` and `GROUP_ID`.
 
-### Hybrid (infra in Docker, services run manually)
+### Topics
 
-```bash
-docker compose --profile infra up -d
-cd services
-pip install confluent-kafka fastapi uvicorn python-multipart httpx jinja2 aiofiles websockets requests
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install ultralytics
-export KAFKA_BOOTSTRAP_SERVERS=localhost:9092 PYTHONPATH=.
-python topic_init/main.py
-python generator/main.py &
-python preprocessor/main.py &
-CLASS_IDS=2,5,7 OUTPUT_TOPIC=detections.cars  GROUP_ID=detector-cars    python detector/main.py &
-CLASS_IDS=0     OUTPUT_TOPIC=detections.persons GROUP_ID=detector-persons python detector/main.py &
-python statistics/main.py &
-UPLOAD_DIR=/tmp/uploads python web/main.py
+| Topic | Partitions | Max msg | Producer |
+|---|---|---|---|
+| `control.upload` | 1 | 4 KB | web |
+| `frames.raw` | 3 | 5 MB | generator |
+| `frames.preprocessed` | 3 | 5 MB | preprocessor |
+| `detections.cars` | 3 | 256 KB | car-detector |
+| `detections.persons` | 3 | 256 KB | person-detector |
+| `tracking.combined` | 3 | 256 KB | tracking-streams |
+| `control.session_end` | 1 | 4 KB | generator |
 
-# tracking-streams is a Java/Kafka Streams app — run it via Docker:
-cd ..
-docker compose --profile app up -d tracking-streams
-```
+`session_id` is the key on every topic, so `hash(session_id) % partitions` keeps a
+session's messages on one partition without any extra coordination.
+
+### Tracking: IoU + centroid
+
+`tracking-streams` runs one `CentroidTracker` per object type (car, person), with each
+session's state kept in a Kafka Streams state store. For every detection frame it does a
+two-pass match between existing tracks and the new detections:
+
+1. **IoU pass** — greedily pairs tracks and detections whose bounding boxes overlap by at
+   least `MIN_IOU = 0.1`, highest overlap first. This keeps a track's ID stable for an
+   object that's growing in frame (e.g. a car driving toward the camera), where the
+   centroid barely moves but the box does.
+2. **Centroid pass** — whatever's left over is matched by nearest centroid distance,
+   capped at `MAX_DISTANCE = 200px`. This is the classic centroid-tracker behaviour for
+   lateral motion.
+
+Tracks unmatched for `MAX_DISAPPEARED = 30` frames are dropped; detections unmatched by
+either pass become new tracks. Each tracker also keeps a cumulative set of every track ID
+it has ever seen, which becomes the `*_total` (unique object) count per session.
+
+### Kafka Streams
+
+`tracking-streams` (`services/tracking-streams`, Java) is a single Kafka Streams app that
+replaced an earlier ksqlDB-based join. Its topology:
+
+1. Consume `detections.cars` / `detections.persons`, run the tracker above via a custom
+   `Processor` backed by a persistent state store keyed by `session_id`.
+2. Rekey each stream to `session_id_frame_number`.
+3. Windowed `LEFT JOIN` (cars side anchored, 2s window + 500ms grace) to pair up car and
+   person tracks for the same frame.
+4. Rekey the joined result back to `session_id` and write it to `tracking.combined`.
+
+This keeps tracker state, the join, and JSON (de)serialization in one JVM process — `web`
+and `statistics` only ever need to read `tracking.combined`.
+
+> Overlay synchronization and the WebSocket connection lifecycle are covered separately
+> in [docs/technical.md](docs/technical.md).
 
 ---
 
-## Verifying CPU vs GPU at runtime
+## Build
 
-### 1. Startup log (fastest)
-
-The detector logs the device it will use before consuming any frames:
+CPU (default, no GPU needed):
 
 ```bash
-docker logs car-detector 2>&1 | grep "device="
-# CPU:  … Loading YOLOv8n model  class_ids=[2, 5, 7]  device=cpu
-# GPU:  … Loading YOLOv8n model  class_ids=[2, 5, 7]  device=cuda
+make build-cpu
 ```
 
-### 2. torch inside the container
+GPU (NVIDIA, CUDA 12.1 torch):
 
 ```bash
-docker exec car-detector python -c "import torch; print(torch.cuda.is_available())"
-# False → CPU image    True → CUDA image
+make build-gpu
 ```
 
-`True` means the CUDA build is installed **and** a GPU is visible to the container. `False` on a `cuda`-tagged container means the NVIDIA runtime is not set up correctly.
+Both produce separate image tags (`capstone-car-detector:cpu` / `:cuda`, same for
+person-detector) and can coexist — build both once and switch with `make up-cpu` /
+`make up-gpu` without rebuilding. GPU builds need the NVIDIA Container Toolkit configured
+for Docker; see the comments in `docker-compose.gpu.yaml` for the WSL2 setup steps.
 
-### 3. GPU utilisation during a run (ground truth)
-
-While a video is being processed, GPU utilisation should be non-zero:
-
-```bash
-nvidia-smi
-# Watch: the python process in the car-detector / person-detector container
-# should show memory usage and > 0 % GPU-Util
-```
-
-If `nvidia-smi` shows 0 % during processing despite using `make up-gpu`, the container is falling back to CPU — check that `torch.cuda.is_available()` returns `True` inside the container (step 2).
-
----
-
-## Rebuild a single service
+To rebuild a single service after a code change:
 
 ```bash
-# CPU
 docker compose --profile app build --no-cache <service-name>
 docker compose --profile app up -d --no-recreate
-
-# GPU (detectors only — they are the only GPU-aware services)
-make build-gpu
-make up-gpu
 ```
 
 ---
 
-## Verification
+## Run
 
 ```bash
-# All Kafka topics created
-docker exec broker kafka-topics --bootstrap-server broker:29092 --list
-
-# Statistics
-curl -s http://localhost:8002/stats | python3 -m json.tool
-
-# Consumer group lag
-docker exec broker kafka-consumer-groups \
-  --bootstrap-server broker:29092 --all-groups --describe
+make infra-up   # Kafka cluster + schema registry + control center (once)
+make up-cpu     # or: make up-gpu
 ```
+
+Open http://localhost:8080, upload a video, and watch it play with overlays. Stats are at
+`GET http://localhost:8080/stats` (proxied to the `statistics` service).
+
+```bash
+make logs        # follow app container logs
+make down        # stop app containers
+make infra-down  # stop the Kafka stack
+```
+
+Useful env vars (set in `docker-compose.yaml`):
+
+| Var | Default | Effect |
+|---|---|---|
+| `FRAME_INTERVAL` | `1` | Process every Nth frame — raise to cut detector load |
+| `DETECTION_FPS_ESTIMATE` | `5` | Expected detector throughput; controls how long `web` waits before ending a session |
+| `OVERLAY_BUFFER_DELAY_S` | `4` | Initial/re-buffer wait in the browser player |
 
 ---
 
-## Project Structure
+## Tests
 
+```bash
+make test
 ```
-capstone/
-├── docker-compose.yaml      # profile: infra (Kafka stack) + profile: app (pipeline)
-├── input.mp4                # sample test video
-├── README.md
-└── services/
-    ├── common/
-    │   └── kafka_client.py      # make_producer, make_consumer, produce_with_backpressure, _lower
-    ├── topic_init/              # Dockerfile  main.py  requirements.txt
-    ├── generator/               # Dockerfile  main.py  requirements.txt
-    ├── preprocessor/            # Dockerfile  main.py  requirements.txt
-    ├── detector/                # shared image: car-detector + person-detector
-    ├── tracking-streams/        # Java/Kafka Streams app: CentroidTracker + windowed join -> tracking.combined
-    ├── statistics/              # Dockerfile  main.py  requirements.txt
-    └── web/
-        ├── Dockerfile
-        ├── main.py
-        ├── requirements.txt
-        └── templates/
-            ├── index.html       # upload form
-            └── view.html        # HTML5 video + canvas overlay + live stats
-```
+
+This brings up the full stack (`infra` + `app` profiles), uploads `test-input.mp4`,
+checks that a `tracking.combined` record and a WebSocket overlay both show up for that
+session, then tears the stack down. Set `E2E_KEEP_STACK=1` to leave the stack running for
+inspection, or `TEST_VIDEO=/path/to/file.mp4` to use a different input.
