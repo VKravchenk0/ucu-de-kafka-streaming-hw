@@ -6,9 +6,9 @@ This project uses **two complementary memory stores**. Use both.
 
 ---
 
-### 1. Capstone Docs Memory Bank (primary project knowledge)
+### 1. Video Pipeline Docs Memory Bank (primary project knowledge)
 
-**Location:** `capstone/docs/memory/`
+**Location:** `video-processing-pipeline/docs/memory/`
 
 Seven structured markdown files that document the project itself — read these before writing code or giving architectural advice.
 
@@ -81,9 +81,9 @@ Add a pointer line in `MEMORY.md`: `- [Title](file.md) — one-line hook`
 
 ---
 
-## Project: Capstone — E2E Kafka Video Analytics
+## Project: Video Processing Pipeline — E2E Kafka Video Analytics
 
-All capstone work lives in `capstone/`. See `capstone/README.md` for full architecture and quickstart.
+All work lives in `video-processing-pipeline/`. See `video-processing-pipeline/README.md` for full architecture and quickstart.
 
 Key facts to keep in mind:
 - Docker build context is always `./services` (never a subdirectory) — required for `COPY common ./common`
