@@ -23,12 +23,12 @@ infra-down:
 # ----------------------------------------------------------------------------
 
 build-cpu:
-	docker compose --profile app build --no-cache
+	docker compose --profile app build
 
 build-gpu:
 	PROCESSING_UNIT_TYPE=cuda docker compose \
 	  -f docker-compose.yaml -f docker-compose.gpu.yaml \
-	  --profile app build --no-cache
+	  --profile app build
 
 # ----------------------------------------------------------------------------
 # Run application stack
