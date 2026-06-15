@@ -13,8 +13,6 @@ Kafka-based pipeline that detects and tracks cars and people in an uploaded vide
 - No GPU? Use the commented CPU commands below instead
 
 ```bash
-cd video-processing-pipeline
-
 # Run Kafka cluster, schema registry, control center
 make infra-up
 
