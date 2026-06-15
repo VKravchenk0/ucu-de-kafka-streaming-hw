@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Live Analytics — {{ session_id[:8] }}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f0f13; color: #e0e0e0;
+           min-height: 100vh; display: flex; flex-direction: column; }
+    header { padding: 1rem 1.5rem; border-bottom: 1px solid #1e1e2e;
+             display: flex; align-items: center; gap: 1rem; }
+    header .sid { font-size: 0.75rem; color: #555; font-family: monospace; }
+    .badge { padding: 0.2rem 0.6rem; border-radius: 99px; font-size: 0.75rem; font-weight: 600; }
+    .badge-live   { background: #1a3d1a; color: #4caf50; }
+    .badge-done   { background: #2a2a1a; color: #ffc107; }
+    .badge-wait   { background: #1a1a2a; color: #888; }
+    .badge-buffer { background: #2a1a0a; color: #ffa726; }
+    main { display: flex; flex: 1; gap: 0; }
+    .video-wrap { position: relative; flex: 1; background: #000; display: flex;
+                  align-items: center; justify-content: center; }
+    video { max-width: 100%; max-height: calc(100vh - 56px); display: block; }
+    canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+    .spinner-wrap { display: none; position: absolute; top: 50%; left: 50%;
+                    transform: translate(-50%, -50%); z-index: 10;
+                    flex-direction: column; align-items: center; gap: 10px; }
+    .spinner-wrap.active { display: flex; }
+    .spinner { width: 52px; height: 52px; border: 4px solid rgba(255,167,38,0.25);
+               border-top-color: #ffa726; border-radius: 50%;
+               animation: spin 0.9s linear infinite; }
+    .spinner-label { font-size: 0.85rem; color: #ffa726; font-weight: 600; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    aside { width: 260px; min-width: 220px; background: #13131c; border-left: 1px solid #1e1e2e;
+            padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; overflow-y: auto; }
+    .stat-group { background: #1a1a24; border: 1px solid #2e2e44; border-radius: 8px; padding: 1rem; }
+    .stat-group h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
+                     color: #666; margin-bottom: 0.75rem; }
+    .stat-row { display: flex; justify-content: space-between; align-items: baseline;
+                margin-bottom: 0.4rem; font-size: 0.9rem; }
+    .stat-row .label { color: #aaa; }
+    .stat-row .value { font-size: 1.2rem; font-weight: 700; color: #fff; font-variant-numeric: tabular-nums; }
+    .stat-row .value.car { color: #ff9800; }
+    .stat-row .value.person { color: #29b6f6; }
+    .info { font-size: 0.78rem; color: #555; line-height: 1.5; }
+    a.back { font-size: 0.85rem; color: #6c63ff; text-decoration: none; }
+    a.back:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="back" href="/">&#8592; Upload</a>
+    <span class="sid">{{ session_id }}</span>
+    <span class="badge badge-buffer" id="status-badge">Buffering…</span>
+  </header>
+
+  <main>
+    <div class="video-wrap" id="video-wrap">
+      <video id="vid" src="/video/{{ session_id }}" controls muted playsinline></video>
+      <canvas id="overlay"></canvas>
+      <div id="spinner-wrap" class="spinner-wrap active">
+        <div class="spinner"></div>
+        <span class="spinner-label">Buffering…</span>
+      </div>
+    </div>
+
+    <aside>
+      <div class="stat-group">
+        <h3>Session Stats</h3>
+        <div class="stat-row"><span class="label">Cars in frame</span><span class="value car" id="cars-frame">—</span></div>
+        <div class="stat-row"><span class="label">Cars total</span><span class="value car" id="cars-total">—</span></div>
+        <div class="stat-row"><span class="label">People in frame</span><span class="value person" id="persons-frame">—</span></div>
+        <div class="stat-row"><span class="label">People total</span><span class="value person" id="persons-total">—</span></div>
+      </div>
+
+      <div class="info" id="info-box"></div>
+    </aside>
+  </main>
+
+  <script>
+    const SESSION_ID = "{{ session_id }}";
+    const BUFFER_DELAY_MS = {{ buffer_delay_s }} * 1000;
+
+    // DOM refs — declared first to avoid TDZ errors in any callback below.
+    const vid         = document.getElementById('vid');
+    const canvas      = document.getElementById('overlay');
+    const ctx         = canvas.getContext('2d');
+    const statusBadge = document.getElementById('status-badge');
+    const infoBox     = document.getElementById('info-box');
+    const spinnerWrap = document.getElementById('spinner-wrap');
+
+    function setEl(id, val) { document.getElementById(id).textContent = val; }
+
+    // -----------------------------------------------------------------------
+    // Canvas sizing
+    // -----------------------------------------------------------------------
+    function syncCanvas() {
+      const vr = vid.getBoundingClientRect();
+      const wr = vid.parentElement.getBoundingClientRect();
+      canvas.style.left   = (vr.left - wr.left) + 'px';
+      canvas.style.top    = (vr.top  - wr.top)  + 'px';
+      canvas.style.width  = vr.width  + 'px';
+      canvas.style.height = vr.height + 'px';
+      canvas.width  = vid.videoWidth  || vr.width;
+      canvas.height = vid.videoHeight || vr.height;
+    }
+    vid.addEventListener('loadedmetadata', syncCanvas);
+    vid.addEventListener('play', syncCanvas);
+    window.addEventListener('resize', syncCanvas);
+
+    // -----------------------------------------------------------------------
+    // Overlay buffer
+    // -----------------------------------------------------------------------
+    const overlayBuffer = new Map();
+    window.overlayBuffer = overlayBuffer;
+
+    let maxBufferedMs = -1;
+
+    // True once the pipeline has delivered overlays up to (or within tolerance of)
+    // vid.duration.  At that point there is no more buffer to accumulate, so any
+    // pending stall should release regardless of RESUME_ADVANCE_MS.
+    function pipelineReachedEnd() {
+      return vid.duration > 0 && maxBufferedMs + OVERLAY_STALE_TOLERANCE_MS >= vid.duration * 1000;
+    }
+
+    function addOverlay(payload) {
+      overlayBuffer.set(payload.video_timestamp_ms, payload);
+      if (payload.video_timestamp_ms > maxBufferedMs) {
+        maxBufferedMs = payload.video_timestamp_ms;
+        // Resume as soon as the pipeline has buffered RESUME_ADVANCE_MS of video
+        // ahead of the current playhead — or the pipeline has reached the end of
+        // the video (no more overlays will arrive).
+        if (inBuffering && !processingDone &&
+            (pipelineReachedEnd() || maxBufferedMs >= vid.currentTime * 1000 + RESUME_ADVANCE_MS)) {
+          exitBuffering();
+        }
+      }
+    }
+
+    // Return the latest overlay whose timestamp is at or before currentMs.
+    // Never returns a future-frame overlay — ensures displayed boxes always
+    // correspond to a frame the video has already shown.
+    function findLatestOverlayBefore(currentMs) {
+      let best = null, bestTs = -1;
+      for (const [ts, payload] of overlayBuffer) {
+        if (ts <= currentMs && ts > bestTs) { bestTs = ts; best = payload; }
+      }
+      return best;
+    }
+
+    // -----------------------------------------------------------------------
+    // Buffer state machine
+    // -----------------------------------------------------------------------
+    let processingDone = false;
+    let inBuffering    = false;
+    let bufferingTimer = null;
+
+    // Tolerance applied only in the last 2 s of the video, where there is a
+    // structural gap between the final emitted overlay and vid.duration.
+    const OVERLAY_STALE_TOLERANCE_MS = 500;
+
+    // How many ms of video must be buffered AHEAD of the playhead before the
+    // video is allowed to resume after a stall.  This creates hysteresis:
+    // - Enter buffering at 0 tolerance (the moment the playhead catches up)
+    // - Exit buffering only once RESUME_ADVANCE_MS of video is ready ahead
+    // At CPU detection rate (~5 fps): stalls last ~4 s and play windows are ~4 s.
+    // At GPU rates (>video fps): the buffer stays full and no stalls occur.
+    const RESUME_ADVANCE_MS = BUFFER_DELAY_MS / 2;
+
+    function enterBuffering() {
+      if (inBuffering) return;
+      inBuffering = true;
+      if (!vid.paused) vid.pause();
+      spinnerWrap.classList.add('active');
+      statusBadge.textContent = 'Buffering…';
+      statusBadge.className   = 'badge badge-buffer';
+      scheduleBufferCheck();
+    }
+
+    function scheduleBufferCheck() {
+      if (bufferingTimer) clearTimeout(bufferingTimer);
+      bufferingTimer = setTimeout(() => {
+        bufferingTimer = null;
+        const currentMs = vid.currentTime * 1000;
+        if (processingDone || pipelineReachedEnd() || maxBufferedMs >= currentMs + RESUME_ADVANCE_MS) {
+          exitBuffering();
+        } else {
+          // Pipeline still behind — wait another N seconds.
+          scheduleBufferCheck();
+        }
+      }, BUFFER_DELAY_MS);
+    }
+
+    function exitBuffering() {
+      if (bufferingTimer) { clearTimeout(bufferingTimer); bufferingTimer = null; }
+      inBuffering = false;
+      spinnerWrap.classList.remove('active');
+      if (!processingDone) {
+        vid.play().catch(() => {});
+        statusBadge.textContent = 'Processing';
+        statusBadge.className   = 'badge badge-live';
+      }
+    }
+
+    // Start the initial buffer wait immediately on page load.
+    enterBuffering();
+
+    // -----------------------------------------------------------------------
+    // Drawing
+    // -----------------------------------------------------------------------
+    const COLORS = { car: '#ff9800', person: '#29b6f6' };
+
+    function drawBoxes(overlay) {
+      syncCanvas();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!overlay) return;
+
+      const scaleX = canvas.width  / 640;
+      const scaleY = canvas.height / 640;
+
+      function drawTrack(t, color, label) {
+        if (!t.bbox) return;
+        const [x1, y1, x2, y2] = t.bbox;
+        const sx = x1 * scaleX, sy = y1 * scaleY;
+        const sw = (x2 - x1) * scaleX, sh = (y2 - y1) * scaleY;
+
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 5;
+        ctx.strokeRect(sx, sy, sw, sh);
+
+        const text = `${label} ${t.track_id}`;
+        ctx.font = 'bold 30px system-ui';
+        const tw = ctx.measureText(text).width;
+        ctx.fillStyle = color;
+        ctx.fillRect(sx - 1, sy - 48, tw + 11, 48);
+        ctx.fillStyle = '#000';
+        ctx.fillText(text, sx + 3, sy - 10);
+      }
+
+      (overlay.car_tracks    || []).forEach(t => drawTrack(t, COLORS.car,    'Car'));
+      (overlay.person_tracks || []).forEach(t => drawTrack(t, COLORS.person, 'Person'));
+    }
+
+    // -----------------------------------------------------------------------
+    // Animation loop
+    // -----------------------------------------------------------------------
+    let _dbgTick = 0;
+    function animate() {
+      const currentMs = vid.currentTime * 1000;
+      const overlay   = findLatestOverlayBefore(currentMs);
+      drawBoxes(overlay);
+
+      if (overlay) {
+        setEl('cars-frame',    overlay.cars_in_frame    ?? '—');
+        setEl('cars-total',    overlay.cars_total       ?? '—');
+        setEl('persons-frame', overlay.persons_in_frame ?? '—');
+        setEl('persons-total', overlay.persons_total    ?? '—');
+      }
+
+      // Stall when video passes the last buffered overlay. Apply tolerance only
+      // near end-of-video to absorb the structural gap after the final overlay.
+      if (!processingDone && !inBuffering) {
+        const nearEnd = vid.duration && currentMs > vid.duration * 1000 - 2000;
+        const threshold = nearEnd ? OVERLAY_STALE_TOLERANCE_MS : 0;
+        if (maxBufferedMs < 0 || currentMs > maxBufferedMs + threshold) {
+          enterBuffering();
+        }
+      }
+
+      if (++_dbgTick % 180 === 0) {
+        console.log(`[overlay] t=${currentMs.toFixed(0)}ms maxBuf=${maxBufferedMs.toFixed(0)}ms buffer=${overlayBuffer.size} buffering=${inBuffering}`);
+      }
+
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+
+    // -----------------------------------------------------------------------
+    // WebSocket
+    // -----------------------------------------------------------------------
+    let wsRetries = 0;
+
+    function connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}/ws/${SESSION_ID}`);
+
+      ws.onopen = () => {
+        wsRetries = 0;
+      };
+
+      ws.onmessage = (e) => {
+        const payload = JSON.parse(e.data);
+        if (payload._done) {
+          processingDone = true;
+          exitBuffering();
+          statusBadge.textContent = 'Done';
+          statusBadge.className   = 'badge badge-done';
+          infoBox.textContent = `Processing complete. ${payload.total_frames} frames analysed.`;
+          return;
+        }
+        addOverlay(payload);
+      };
+
+      ws.onclose = () => {
+        if (wsRetries < 5) {
+          wsRetries++;
+          setTimeout(connectWS, 2000 * wsRetries);
+        }
+      };
+      ws.onerror = () => ws.close();
+    }
+    connectWS();
+  </script>
+</body>
+</html>

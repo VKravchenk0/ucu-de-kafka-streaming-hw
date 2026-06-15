@@ -1,0 +1,4 @@
+pytest
+requests
+websocket-client
+confluent-kafka

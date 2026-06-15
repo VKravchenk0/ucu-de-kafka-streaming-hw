@@ -1,0 +1,36 @@
+# GPU override — merge with docker-compose.yaml when building/running with PROCESSING_UNIT_TYPE=cuda.
+#
+# Usage:
+#   PROCESSING_UNIT_TYPE=cuda docker compose \
+#     -f docker-compose.yaml -f docker-compose.gpu.yaml \
+#     --profile app build car-detector person-detector
+#
+#   PROCESSING_UNIT_TYPE=cuda docker compose \
+#     -f docker-compose.yaml -f docker-compose.gpu.yaml \
+#     --profile app up -d
+#
+# Requirements (NVIDIA / WSL2):
+#   - NVIDIA driver >= 470.76 on the Windows host
+#   - nvidia-container-toolkit installed inside WSL2
+#     https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#   - Docker daemon configured to use the nvidia runtime
+#     (nvidia-container-toolkit does this automatically via `sudo nvidia-ctk runtime configure --runtime=docker`)
+
+services:
+  car-detector:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  person-detector:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
