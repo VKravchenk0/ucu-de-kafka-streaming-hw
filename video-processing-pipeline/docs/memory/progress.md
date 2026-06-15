@@ -4,7 +4,7 @@
 
 ### Core Pipeline
 - [x] Video upload via browser (drag-and-drop + click)
-- [x] Frame extraction with configurable `FRAME_INTERVAL` (currently 3)
+- [x] Frame extraction with configurable `FRAME_INTERVAL` (currently 1, i.e. every frame; `3` was tried for load reduction and reverted when switching to Kafka Streams)
 - [x] JPEG encoding, base64 framing, Kafka fan-out
 - [x] Preprocessor resizes frames to 640×640
 - [x] YOLOv8n inference (CPU default, GPU optional)
@@ -50,8 +50,9 @@
 | Basic E2E pipeline (upload → detect → overlay) | Complete |
 | Per-session tracking (not global) | Complete |
 | GPU support | Complete |
-| Buffer-aware playback (spinner, stall recovery) | Complete |
-| Frame skipping for performance | Complete |
+| Buffer-aware playback (spinner, stall recovery + resume hysteresis) | Complete |
 | README + Makefile for easy startup | Complete |
 | Memory bank docs | Complete |
-| Kafka Streams tracking + join refactor | Complete |
+| Kafka Streams tracking + join refactor (replaced ksqlDB) | Complete |
+| Technical docs split into `docs/technical.md` (Mermaid sequence/state diagrams) | Complete |
+| UI simplification (header, badges, info box) | Complete |

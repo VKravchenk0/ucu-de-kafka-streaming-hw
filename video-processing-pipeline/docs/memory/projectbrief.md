@@ -31,7 +31,9 @@ video-processing-pipeline/       ← all work is here
 ├── docker-compose.yaml          ← full stack definition
 ├── docker-compose.gpu.yaml      ← GPU overlay (NVIDIA only)
 ├── Makefile                     ← common dev commands
-└── docs/memory/                 ← this memory bank
+└── docs/
+    ├── technical.md             ← overlay sync + WS lifecycle (Mermaid diagrams)
+    └── memory/                  ← this memory bank
 ```
 
 ## Key Constraint

@@ -14,8 +14,9 @@
 
 ### Buffer-aware video playback (view.html)
 - Video starts paused with a spinner and "Buffering…" badge
-- Initial `OVERLAY_BUFFER_DELAY_S` (default 4 s) forced wait before first play attempt
-- Mid-video stalls trigger another N-second re-buffer wait when `currentMs > maxBufferedMs + 500`
+- Initial `OVERLAY_BUFFER_DELAY_S` (default 4 s, `BUFFER_DELAY_MS` in JS) forced wait before first play attempt
+- Mid-video stalls re-enter buffering when `currentMs > maxBufferedMs + threshold` (threshold = `OVERLAY_STALE_TOLERANCE_MS` only in the last 2s of video, else 0)
+- Resuming requires `maxBufferedMs >= currentMs + RESUME_ADVANCE_MS` (`RESUME_ADVANCE_MS = BUFFER_DELAY_MS / 2`, i.e. 2s by default), or the pipeline has reached end-of-video / `_done` — this hysteresis stops play/pause flapping
 - `_done` signal exits buffering permanently; video plays freely
 - `OVERLAY_STALE_TOLERANCE_MS = 500` prevents end-of-video spurious stall
 
@@ -23,16 +24,20 @@
 - `PROCESSING_UNIT_TYPE` build arg selects CPU vs CUDA torch wheels in `detector/Dockerfile`
 - `docker-compose.gpu.yaml` overlay adds NVIDIA device reservation to both detectors
 - Separate image tags: `car-detector:cpu` / `car-detector:cuda`
-- `make build-gpu` / `make up-gpu` in Makefile
+- `make build-gpu` / `make up-gpu` in Makefile; README quickstart now leads with the GPU path (CPU commands are commented alternatives), though `PROCESSING_UNIT_TYPE` still defaults to `cpu` in `docker-compose.yaml` if unset
 
 ### Removed global counters
 - `statistics/main.py` previously maintained `global_cars`, `global_persons` sets
-- Removed; `/stats` response now only contains per-session data
+- Removed; `/stats` response is now `{"sessions": {sid: {"unique_cars": N, "unique_persons": M}}}` only — no `global` key, no per-session `status` field
 
-### Frame skipping
-- `FRAME_INTERVAL` set to `"3"` in `docker-compose.yaml` (was `"1"`)
-- Reduces frames processed from ~695 to ~232 for a 23-second video at 30fps
-- Cuts detection pipeline load ~3×
+### Technical docs split out (`docs/technical.md`)
+- Overlay sync sequence diagram and WebSocket connection-lifecycle state diagram (both Mermaid) moved out of the README into `docs/technical.md`
+- Covers `_done` timing formula and the buffering/stall hysteresis described above
+
+### UI simplification (2026-06-13 → 2026-06-15)
+- `index.html` title changed to "Video Stream Processing Pipeline"
+- `view.html` header simplified: removed the "Live Analytics" `<h1>` and the `WS: connecting/live/closed` status indicator entirely; "Upload another" → "Upload"
+- Session stats panel heading "This Session" → "Session Stats"; `#info-box` starts empty and is populated by JS instead of a hardcoded "Buffering…" message
 
 ## Current Known Issues / Watch Points
 

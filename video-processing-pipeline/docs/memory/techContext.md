@@ -19,15 +19,20 @@
 
 ## Infrastructure (docker-compose.yaml, profile: infra)
 
+`make infra-up` starts all of these — they're the Confluent-platform demo stack the
+course template ships with. Only `broker*` and `schema-registry` are actually consumed by
+the app pipeline; `connect`, `rest-proxy`, and the `flink-*` services are unused scaffolding.
+
 | Service | Image | Purpose |
 |---|---|---|
-| broker | confluentinc/cp-kafka:7.5.0 | 3-broker KRaft Kafka cluster |
-| schema-registry | confluentinc/cp-schema-registry:7.5.0 | Schema registry |
-| connect | confluentinc/cp-kafka-connect:7.5.0 | Kafka Connect |
-| control-center | confluentinc/cp-enterprise-control-center:7.5.0 | Kafka UI (port 9021) |
-| rest-proxy | confluentinc/cp-kafka-rest:7.5.0 | REST proxy |
-| prometheus | prom/prometheus:v2.54.1 | Metrics scraping |
-| alertmanager | prom/alertmanager:v0.27.0 | Alerting |
+| broker, broker-2, broker-3 | confluentinc/cp-server:8.2.0 | 3-broker KRaft Kafka cluster |
+| schema-registry | confluentinc/cp-schema-registry:8.2.0 | Schema registry |
+| connect | cnfldemos/cp-server-connect-datagen:0.6.4-7.6.0 | Kafka Connect (unused by app) |
+| control-center | confluentinc/cp-enterprise-control-center-next-gen:2.5.0 | Kafka UI (port 9021) |
+| rest-proxy | confluentinc/cp-kafka-rest:8.2.0 | REST proxy (unused by app) |
+| prometheus | confluentinc/cp-enterprise-prometheus:2.5.0 | Metrics scraping |
+| alertmanager | confluentinc/cp-enterprise-alertmanager:2.5.0 | Alerting |
+| flink-jobmanager / flink-taskmanager / flink-sql-client | cnfldemos/flink-kafka:1.19.1-scala_2.12-java17 / flink-sql-client-kafka:1.19.1-scala_2.12-java17 | Flink (unused by app) |
 
 ## Application Services (docker-compose.yaml, profile: app)
 

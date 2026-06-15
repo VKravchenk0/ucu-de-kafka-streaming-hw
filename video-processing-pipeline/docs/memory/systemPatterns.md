@@ -2,39 +2,26 @@
 
 ## Message Flow
 
-```
-Browser
-  │  POST /upload
-  ▼
-web ──► control.upload
-          │
-          ▼
-       generator ──► frames.raw  ──► preprocessor ──► frames.preprocessed
-          │                                               │           │
-          ▼                                               ▼           ▼
-    control.session_end                          car-detector   person-detector
-          │                                          │                │
-          ├──────────────────────────────────►  detections.cars  detections.persons
-          │                                          │                │
-          │                                          └───────┬────────┘
-          │                                                   ▼
-          │                                          tracking-streams
-          │                                       (CentroidTracker x2 +
-          │                                        windowed LEFT JOIN)
-          │                                                   │
-          │                                                   ▼
-          │                                          tracking.combined
-          │                                                   │
-          │                                          ┌────────┴────────┐
-          │                                          ▼                 ▼
-          │                                     statistics            web
-          │                                                            │
-          └──────────────────────────────────────────────────────────►│
-                                                                        ▼
-                                                                  WebSocket
-                                                                        │
-                                                                        ▼
-                                                                 Browser canvas
+```mermaid
+flowchart TD
+    Browser["Browser"] -->|"POST /upload"| WEB["web"]
+    WEB --> CU["control.upload"]
+    CU --> GEN["generator"]
+    GEN --> FR["frames.raw"]
+    GEN --> SE["control.session_end"]
+    FR --> PRE["preprocessor"]
+    PRE --> FP["frames.preprocessed"]
+    FP --> CAR["car-detector"]
+    FP --> PER["person-detector"]
+    CAR --> DC["detections.cars"]
+    PER --> DP["detections.persons"]
+    DC --> TS["tracking-streams<br/>(CentroidTracker x2 +<br/>windowed LEFT JOIN)"]
+    DP --> TS
+    TS --> TC["tracking.combined"]
+    TC --> STAT["statistics"]
+    TC --> WEB
+    SE --> WEB
+    WEB -->|"WebSocket"| Canvas["Browser canvas"]
 ```
 
 ## Kafka Topic Design
@@ -71,22 +58,14 @@ This prevents the WebSocket from closing before all `tracking.combined` records 
 
 ## Web Service: Overlay Fan-Out
 
-```
-kafka_consumer_thread (background thread)
-    │   consumes tracking.combined (Kafka Streams LEFT JOIN output)
-    │   _lower() normalises field names (defensive no-op)
-    │
-    ▼
-_dispatch(session_id, overlay_dict)
-    ├── _overlay_store[session_id].append(item)    # durable; never deleted
-    └── for q in _subscribers[session_id]:
-            asyncio.run_coroutine_threadsafe(q.put(item), _loop)
-                    │
-                    ▼
-            WebSocket handler (async)
-                    │
-                    ▼
-               Browser
+```mermaid
+flowchart TD
+    KCT["kafka_consumer_thread (background thread)<br/>consumes tracking.combined<br/>_lower() normalises field names (defensive no-op)"]
+    KCT --> DISPATCH["_dispatch(session_id, overlay_dict)"]
+    DISPATCH --> STORE["_overlay_store[session_id].append(item)<br/>(durable; never deleted)"]
+    DISPATCH --> QUEUES["for q in _subscribers[session_id]:<br/>asyncio.run_coroutine_threadsafe(q.put(item), _loop)"]
+    QUEUES --> WS["WebSocket handler (async)"]
+    WS --> Browser["Browser"]
 ```
 
 New WebSocket connections first replay `_overlay_store` (catch-up), then drain live from their subscriber queue.
@@ -95,19 +74,23 @@ The windowed join may emit two messages per frame (first with null person data, 
 
 ## Buffer-Aware Playback (Browser)
 
-```
-State: BUFFERING ──(timer + overlays present)──► PLAYING
-         ▲                                           │
-         └──────(currentMs > maxBufferedMs + 500)────┘
-         
-PLAYING ──(_done received)──► DONE (plays freely forever)
-
-enterBuffering(): pause + spinner + N-second timer
-scheduleBufferCheck(): fires after BUFFER_DELAY_MS; exits if maxBufferedMs >= currentMs - 500
-exitBuffering(): hide spinner + vid.play()
+```mermaid
+stateDiagram-v2
+    [*] --> BUFFERING: enterBuffering()<br/>pause + spinner + BUFFER_DELAY_MS timer
+    BUFFERING --> BUFFERING: scheduleBufferCheck() fires,<br/>buffer still behind -> reschedule
+    BUFFERING --> PLAYING: maxBufferedMs >= currentMs + RESUME_ADVANCE_MS<br/>(or pipelineReachedEnd / processingDone)<br/>-> exitBuffering()
+    PLAYING --> BUFFERING: currentMs > maxBufferedMs + threshold<br/>(threshold = OVERLAY_STALE_TOLERANCE_MS<br/>only in last 2s of video, else 0)
+    PLAYING --> DONE: _done received
+    DONE --> DONE: plays freely forever,<br/>never re-enters BUFFERING
 ```
 
-`OVERLAY_STALE_TOLERANCE_MS = 500` prevents spurious end-of-video stalls caused by the structural gap between the last emitted overlay and `vid.duration`.
+`RESUME_ADVANCE_MS = BUFFER_DELAY_MS / 2` (2s by default) is the resume hysteresis — the
+pipeline must be at least that far ahead of the playhead before playback resumes, which
+stops the player flapping between play/pause every frame.
+
+`OVERLAY_STALE_TOLERANCE_MS = 500` prevents spurious end-of-video stalls caused by the
+structural gap between the last emitted overlay and `vid.duration`; it only applies in the
+last 2 seconds of the video.
 
 ## Shared Image Pattern (detector)
 
@@ -133,7 +116,11 @@ person-detector:
 Implemented in `services/tracking-streams` (Java, `Main.java` / `TrackingProcessor.java`).
 
 ### Per-object-type tracking → rekey
-- `detections.cars` and `detections.persons` are each processed by a `CentroidTracker` (greedy centroid matching, 30-frame disappear window) backed by a persistent state store (`car-tracker-state` / `person-tracker-state`)
+- `detections.cars` and `detections.persons` are each processed by a `CentroidTracker` backed by a persistent state store (`car-tracker-state` / `person-tracker-state`), keyed by `session_id`. State stores are never cleaned up (matches `_overlay_store`'s never-deleted pattern).
+- Two-pass cascade matching per frame (see `CentroidTracker.java`):
+  1. **IoU pass** — greedily pairs existing tracks ↔ new detections by IoU ≥ `MIN_IOU` (0.1), highest overlap first. Keeps a track's ID stable for objects growing in frame (e.g. approaching camera) where the centroid barely moves but IoU stays high.
+  2. **Centroid pass** — remaining unmatched tracks/detections are paired by nearest centroid distance, capped at `MAX_DISTANCE` (200px).
+  - Tracks unmatched in either pass for `MAX_DISAPPEARED` (30) frames are dropped; unmatched detections become new tracks. Each tracker keeps a cumulative set of every track ID it has ever seen → `*_total` (unique count) per session.
 - Each tracked stream is rekeyed by `session_id + "_" + frame_number`
 
 ### Windowed Stream-Stream JOIN → `tracking.combined`
