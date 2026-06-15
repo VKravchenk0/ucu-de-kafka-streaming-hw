@@ -20,7 +20,6 @@ make infra-up
 
 # first run only — pulls CUDA torch (~2 GB), ~15-20 min
 make build-gpu
-
 # CPU-only alternative — pulls CPU torch (~200 MB), ~5-10 min
 # make build-cpu
 
@@ -29,7 +28,7 @@ make up-gpu
 # make up-cpu
 ```
 
-Open http://localhost:8080 and upload a video.
+Open http://localhost:8080 and upload a video (`input.mp4/input2.mp4/input3.mp4`).
 
 ---
 
